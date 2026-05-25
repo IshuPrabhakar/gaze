@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="accessibility_service_description">Gaze enables vertical hands-free scrolling using eye attention detection from the front camera.</string>
+</resources>
