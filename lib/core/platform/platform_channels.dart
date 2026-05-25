@@ -5,32 +5,62 @@ class GazeTelemetryState {
   final bool isFaceDetected;
   final bool isAttentive;
   final bool isLookingDown;
+  final bool isLookingUp;
   final bool isBlinking;
   final double yaw;
   final double pitch;
   final double eyeOpenness;
   final String activeApp;
-
+  final bool isNodLeft;
+  final bool isNodRight;
+  final bool isNodUp;
+  final bool isNodDown;
+  final String detectedHandGesture;
+  final bool isSwipeLeft;
+  final bool isSwipeRight;
+  final bool isSwipeUp;
+  final bool isSwipeDown;
+ 
   GazeTelemetryState({
     required this.isFaceDetected,
     required this.isAttentive,
     required this.isLookingDown,
+    required this.isLookingUp,
     required this.isBlinking,
     required this.yaw,
     required this.pitch,
     required this.eyeOpenness,
     required this.activeApp,
+    required this.isNodLeft,
+    required this.isNodRight,
+    required this.isNodUp,
+    required this.isNodDown,
+    required this.detectedHandGesture,
+    required this.isSwipeLeft,
+    required this.isSwipeRight,
+    required this.isSwipeUp,
+    required this.isSwipeDown,
   });
 
   factory GazeTelemetryState.empty() => GazeTelemetryState(
         isFaceDetected: false,
         isAttentive: false,
         isLookingDown: false,
+        isLookingUp: false,
         isBlinking: false,
         yaw: 0.0,
         pitch: 0.0,
         eyeOpenness: 0.0,
         activeApp: '',
+        isNodLeft: false,
+        isNodRight: false,
+        isNodUp: false,
+        isNodDown: false,
+        detectedHandGesture: 'NONE',
+        isSwipeLeft: false,
+        isSwipeRight: false,
+        isSwipeUp: false,
+        isSwipeDown: false,
       );
 
   factory GazeTelemetryState.fromMap(Map<dynamic, dynamic> map) {
@@ -38,11 +68,21 @@ class GazeTelemetryState {
       isFaceDetected: map['isFaceDetected'] as bool? ?? false,
       isAttentive: map['isAttentive'] as bool? ?? false,
       isLookingDown: map['isLookingDown'] as bool? ?? false,
+      isLookingUp: map['isLookingUp'] as bool? ?? false,
       isBlinking: map['isBlinking'] as bool? ?? false,
       yaw: (map['yaw'] as num? ?? 0.0).toDouble(),
       pitch: (map['pitch'] as num? ?? 0.0).toDouble(),
       eyeOpenness: (map['eyeOpenness'] as num? ?? 0.0).toDouble(),
       activeApp: map['activeApp'] as String? ?? '',
+      isNodLeft: map['isNodLeft'] as bool? ?? false,
+      isNodRight: map['isNodRight'] as bool? ?? false,
+      isNodUp: map['isNodUp'] as bool? ?? false,
+      isNodDown: map['isNodDown'] as bool? ?? false,
+      detectedHandGesture: map['detectedHandGesture'] as String? ?? 'NONE',
+      isSwipeLeft: map['isSwipeLeft'] as bool? ?? false,
+      isSwipeRight: map['isSwipeRight'] as bool? ?? false,
+      isSwipeUp: map['isSwipeUp'] as bool? ?? false,
+      isSwipeDown: map['isSwipeDown'] as bool? ?? false,
     );
   }
 }
@@ -72,6 +112,7 @@ class PlatformChannels {
     required bool pauseOnLookAway,
     required bool systemWide,
     required List<String> enabledApps,
+    required String swipeMode,
   }) async {
     try {
       final bool result = await _serviceChannel.invokeMethod<bool>('startService', {
@@ -81,6 +122,7 @@ class PlatformChannels {
         'pauseOnLookAway': pauseOnLookAway,
         'systemWide': systemWide,
         'enabledApps': enabledApps,
+        'swipeMode': swipeMode,
       }) ?? false;
       return result;
     } on PlatformException catch (_) {
@@ -174,6 +216,26 @@ class PlatformChannels {
   static Future<bool> triggerScrollUp(double speed) async {
     try {
       return await _serviceChannel.invokeMethod<bool>('triggerScrollUp', {
+        'scrollSpeed': speed,
+      }) ?? false;
+    } on PlatformException catch (_) {
+      return false;
+    }
+  }
+
+  static Future<bool> triggerScrollLeft(double speed) async {
+    try {
+      return await _serviceChannel.invokeMethod<bool>('triggerScrollLeft', {
+        'scrollSpeed': speed,
+      }) ?? false;
+    } on PlatformException catch (_) {
+      return false;
+    }
+  }
+
+  static Future<bool> triggerScrollRight(double speed) async {
+    try {
+      return await _serviceChannel.invokeMethod<bool>('triggerScrollRight', {
         'scrollSpeed': speed,
       }) ?? false;
     } on PlatformException catch (_) {

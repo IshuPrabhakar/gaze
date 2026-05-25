@@ -27,6 +27,7 @@ class ServiceControl extends _$ServiceControl {
       pauseOnLookAway: settings.pauseOnLookAway,
       systemWide: settings.systemWide,
       enabledApps: settings.enabledApps,
+      swipeMode: settings.swipeMode,
     );
     if (success) {
       state = true;

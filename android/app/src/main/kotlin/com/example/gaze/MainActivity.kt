@@ -43,6 +43,7 @@ class MainActivity : FlutterActivity() {
                     val pauseOnLook = call.argument<Boolean>("pauseOnLookAway") ?: false
                     val systemWide = call.argument<Boolean>("systemWide") ?: true
                     val apps = call.argument<List<String>>("enabledApps") ?: emptyList()
+                    val swipeMode = call.argument<String>("swipeMode") ?: "eyeTracking"
                     
                     GazeForegroundService.sensitivity = sens
                     GazeForegroundService.scrollSpeed = speed
@@ -50,6 +51,7 @@ class MainActivity : FlutterActivity() {
                     GazeForegroundService.pauseOnLookAway = pauseOnLook
                     GazeForegroundService.systemWide = systemWide
                     GazeForegroundService.enabledApps = apps
+                    GazeForegroundService.swipeMode = swipeMode
                     
                     try {
                         val serviceIntent = Intent(this, GazeForegroundService::class.java)
@@ -66,10 +68,20 @@ class MainActivity : FlutterActivity() {
                                     "isFaceDetected" to state.isFaceDetected,
                                     "isAttentive" to state.isAttentive,
                                     "isLookingDown" to state.isLookingDown,
+                                    "isLookingUp" to state.isLookingUp,
                                     "isBlinking" to state.isBlinking,
                                     "yaw" to state.yaw,
                                     "pitch" to state.pitch,
                                     "eyeOpenness" to state.eyeOpenness,
+                                    "isNodLeft" to state.isNodLeft,
+                                    "isNodRight" to state.isNodRight,
+                                    "isNodUp" to state.isNodUp,
+                                    "isNodDown" to state.isNodDown,
+                                    "detectedHandGesture" to state.detectedHandGesture,
+                                    "isSwipeLeft" to state.isSwipeLeft,
+                                    "isSwipeRight" to state.isSwipeRight,
+                                    "isSwipeUp" to state.isSwipeUp,
+                                    "isSwipeDown" to state.isSwipeDown,
                                     "activeApp" to GazeAccessibilityService.activePackageName
                                 )
                                 telemetryChannel?.invokeMethod("onGazeStateChanged", data)
@@ -151,6 +163,16 @@ class MainActivity : FlutterActivity() {
                 "triggerScrollUp" -> {
                     val speed = call.argument<Double>("scrollSpeed")?.toFloat() ?: 1.0f
                     val success = GazeAccessibilityService.instance?.performScrollUp(speed) ?: false
+                    result.success(success)
+                }
+                "triggerScrollLeft" -> {
+                    val speed = call.argument<Double>("scrollSpeed")?.toFloat() ?: 1.0f
+                    val success = GazeAccessibilityService.instance?.performScrollLeft(speed) ?: false
+                    result.success(success)
+                }
+                "triggerScrollRight" -> {
+                    val speed = call.argument<Double>("scrollSpeed")?.toFloat() ?: 1.0f
+                    val success = GazeAccessibilityService.instance?.performScrollRight(speed) ?: false
                     result.success(success)
                 }
                 "isCameraPermissionGranted" -> {

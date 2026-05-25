@@ -12,6 +12,7 @@ class Settings extends _$Settings {
   static const String _keyDuration = 'gaze_duration';
   static const String _keyPauseLookAway = 'gaze_pause_look_away';
   static const String _keySystemWide = 'gaze_system_wide';
+  static const String _keySwipeMode = 'gaze_swipe_mode';
 
   @override
   SettingsState build() {
@@ -23,6 +24,7 @@ class Settings extends _$Settings {
       triggerDurationMs: prefs.getInt(_keyDuration) ?? 800,
       pauseOnLookAway: prefs.getBool(_keyPauseLookAway) ?? false,
       systemWide: prefs.getBool(_keySystemWide) ?? true,
+      swipeMode: prefs.getString(_keySwipeMode) ?? 'eyeTracking',
       enabledApps: prefs.getStringList('gaze_enabled_apps') ?? [
         'com.instagram.android',
         'com.zhiliaoapp.musically',
@@ -43,6 +45,7 @@ class Settings extends _$Settings {
         pauseOnLookAway: state.pauseOnLookAway,
         systemWide: state.systemWide,
         enabledApps: state.enabledApps,
+        swipeMode: state.swipeMode,
       );
     }
   }
@@ -79,6 +82,13 @@ class Settings extends _$Settings {
     final prefs = ref.read(sharedPreferencesProvider);
     await prefs.setBool(_keySystemWide, value);
     state = state.copyWith(systemWide: value);
+    await _applyIfRunning();
+  }
+
+  Future<void> updateSwipeMode(String value) async {
+    final prefs = ref.read(sharedPreferencesProvider);
+    await prefs.setString(_keySwipeMode, value);
+    state = state.copyWith(swipeMode: value);
     await _applyIfRunning();
   }
 

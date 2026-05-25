@@ -39,6 +39,21 @@ class _DebugScreenState extends ConsumerState<DebugScreen> {
         if (next.isLookingDown && !(prev?.isLookingDown ?? false)) {
           _addLog('LOOKING DOWN TRIGGER');
         }
+        if (next.isLookingUp && !(prev?.isLookingUp ?? false)) {
+          _addLog('LOOKING UP TRIGGER');
+        }
+        if (next.isNodLeft && !(prev?.isNodLeft ?? false)) {
+          _addLog('NOD LEFT DETECTED');
+        }
+        if (next.isNodRight && !(prev?.isNodRight ?? false)) {
+          _addLog('NOD RIGHT DETECTED');
+        }
+        if (next.isNodUp && !(prev?.isNodUp ?? false)) {
+          _addLog('NOD UP DETECTED');
+        }
+        if (next.isNodDown && !(prev?.isNodDown ?? false)) {
+          _addLog('NOD DOWN DETECTED');
+        }
         if (next.isBlinking && !(prev?.isBlinking ?? false)) {
           _addLog('BLINK DETECTED');
         }
@@ -47,6 +62,21 @@ class _DebugScreenState extends ConsumerState<DebugScreen> {
         }
         if (!next.isFaceDetected && (prev?.isFaceDetected ?? true)) {
           _addLog('FACE LOST');
+        }
+        if (next.isSwipeLeft && !(prev?.isSwipeLeft ?? false)) {
+          _addLog('HAND SWIPE LEFT');
+        }
+        if (next.isSwipeRight && !(prev?.isSwipeRight ?? false)) {
+          _addLog('HAND SWIPE RIGHT');
+        }
+        if (next.isSwipeUp && !(prev?.isSwipeUp ?? false)) {
+          _addLog('HAND SWIPE UP');
+        }
+        if (next.isSwipeDown && !(prev?.isSwipeDown ?? false)) {
+          _addLog('HAND SWIPE DOWN');
+        }
+        if (next.detectedHandGesture != 'NONE' && next.detectedHandGesture != (prev?.detectedHandGesture ?? 'NONE')) {
+          _addLog('PALM GESTURE: ${next.detectedHandGesture}');
         }
       },
     );
@@ -115,26 +145,54 @@ class _DebugScreenState extends ConsumerState<DebugScreen> {
               ),
               const SizedBox(height: 16),
               // Manual Trigger Bar
-              Row(
+              Column(
                 children: [
-                  Expanded(
-                    child: FButton(
-                      onPress: () async {
-                        _addLog('Manual Scroll Down gesture fired');
-                        await PlatformChannels.triggerScrollDown(1.0);
-                      },
-                      child: const Text('Scroll Down'),
-                    ),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: FButton(
+                          onPress: () async {
+                            _addLog('Manual Scroll Down gesture fired');
+                            await PlatformChannels.triggerScrollDown(1.0);
+                          },
+                          child: const Text('Scroll Down'),
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: FButton(
+                          onPress: () async {
+                            _addLog('Manual Scroll Up gesture fired');
+                            await PlatformChannels.triggerScrollUp(1.0);
+                          },
+                          child: const Text('Scroll Up'),
+                        ),
+                      ),
+                    ],
                   ),
-                  const SizedBox(width: 12),
-                  Expanded(
-                    child: FButton(
-                      onPress: () async {
-                        _addLog('Manual Scroll Up gesture fired');
-                        await PlatformChannels.triggerScrollUp(1.0);
-                      },
-                      child: const Text('Scroll Up'),
-                    ),
+                  const SizedBox(height: 12),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: FButton(
+                          onPress: () async {
+                            _addLog('Manual Scroll Left gesture fired');
+                            await PlatformChannels.triggerScrollLeft(1.0);
+                          },
+                          child: const Text('Scroll Left'),
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: FButton(
+                          onPress: () async {
+                            _addLog('Manual Scroll Right gesture fired');
+                            await PlatformChannels.triggerScrollRight(1.0);
+                          },
+                          child: const Text('Scroll Right'),
+                        ),
+                      ),
+                    ],
                   ),
                 ],
               ),

@@ -5,6 +5,7 @@ class SettingsState {
   final bool pauseOnLookAway;
   final bool systemWide;
   final List<String> enabledApps;
+  final String swipeMode;
 
   SettingsState({
     required this.sensitivity,
@@ -13,6 +14,7 @@ class SettingsState {
     required this.pauseOnLookAway,
     required this.systemWide,
     required this.enabledApps,
+    required this.swipeMode,
   });
 
   SettingsState copyWith({
@@ -22,6 +24,7 @@ class SettingsState {
     bool? pauseOnLookAway,
     bool? systemWide,
     List<String>? enabledApps,
+    String? swipeMode,
   }) {
     return SettingsState(
       sensitivity: sensitivity ?? this.sensitivity,
@@ -30,6 +33,7 @@ class SettingsState {
       pauseOnLookAway: pauseOnLookAway ?? this.pauseOnLookAway,
       systemWide: systemWide ?? this.systemWide,
       enabledApps: enabledApps ?? this.enabledApps,
+      swipeMode: swipeMode ?? this.swipeMode,
     );
   }
 
@@ -40,5 +44,6 @@ class SettingsState {
         pauseOnLookAway: false,
         systemWide: true,
         enabledApps: ['com.instagram.android', 'com.zhiliaoapp.musically', 'com.google.android.youtube'],
+        swipeMode: 'eyeTracking',
       );
 }

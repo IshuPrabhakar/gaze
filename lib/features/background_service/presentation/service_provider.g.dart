@@ -6,7 +6,7 @@ part of 'service_provider.dart';
 // RiverpodGenerator
 // **************************************************************************
 
-String _$serviceControlHash() => r'341ff67f3d04ea6173e51cbf0fc485ebca982002';
+String _$serviceControlHash() => r'828ae1ba59455490d3b00e2f38ea5b6d9d7aa9ca';
 
 /// See also [ServiceControl].
 @ProviderFor(ServiceControl)

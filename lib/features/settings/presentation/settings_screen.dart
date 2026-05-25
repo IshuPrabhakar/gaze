@@ -60,6 +60,92 @@ class SettingsScreen extends ConsumerWidget {
               ),
               const SizedBox(height: 16),
               _buildSettingCard(
+                title: 'Interaction Control Mode',
+                subtitle: 'Choose how vertical swipes are triggered. Horizontal swipes always respond to left/right nods.',
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Row(
+                      children: [
+                        Expanded(
+                          child: ChoiceChip(
+                            label: const Center(
+                              child: Text(
+                                'Eye Gaze',
+                                style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 10),
+                              ),
+                            ),
+                            selected: settings.swipeMode == 'eyeTracking',
+                            selectedColor: const Color(0xFF6366F1),
+                            backgroundColor: const Color(0xFF1E1E24),
+                            showCheckmark: false,
+                            onSelected: (selected) {
+                              if (selected) {
+                                settingsNotifier.updateSwipeMode('eyeTracking');
+                              }
+                            },
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: ChoiceChip(
+                            label: const Center(
+                              child: Text(
+                                'Head Nod',
+                                style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 10),
+                              ),
+                            ),
+                            selected: settings.swipeMode == 'headNod',
+                            selectedColor: const Color(0xFF6366F1),
+                            backgroundColor: const Color(0xFF1E1E24),
+                            showCheckmark: false,
+                            onSelected: (selected) {
+                              if (selected) {
+                                settingsNotifier.updateSwipeMode('headNod');
+                              }
+                            },
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: ChoiceChip(
+                            label: const Center(
+                              child: Text(
+                                'Hand Gesture',
+                                style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 10),
+                              ),
+                            ),
+                            selected: settings.swipeMode == 'handGesture',
+                            selectedColor: const Color(0xFF6366F1),
+                            backgroundColor: const Color(0xFF1E1E24),
+                            showCheckmark: false,
+                            onSelected: (selected) {
+                              if (selected) {
+                                settingsNotifier.updateSwipeMode('handGesture');
+                              }
+                            },
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 12),
+                    Text(
+                      settings.swipeMode == 'eyeTracking'
+                          ? '👉 Eye Gaze Mode: Look up/down and hold your gaze for the trigger duration to scroll vertically.'
+                          : settings.swipeMode == 'headNod'
+                              ? '👉 Head Nodding Mode: Tilt/nod your head up or down to scroll vertically instantly.'
+                              : '👉 Hand Gesture Mode: Swipe your hand in front of the camera to scroll, or use Palm Gestures (Open Palm to Play/Pause, Fist to Stop, Thumbs Up to Select).',
+                      style: const TextStyle(
+                        fontSize: 12,
+                        color: Color(0xFF818CF8),
+                        fontStyle: FontStyle.italic,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 16),
+              _buildSettingCard(
                 title: 'Trigger Hold Duration: ${settings.triggerDurationMs}ms',
                 subtitle: 'Eye attention must continuously look downward for this duration before vertical swipes fire.',
                 child: Row(
