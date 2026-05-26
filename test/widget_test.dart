@@ -1,8 +1,8 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:gaze/main.dart';
+import 'package:gaze/src/app/app.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:gaze/core/services/shared_preferences_provider.dart';
+import 'package:gaze/src/core/services/shared_preferences_provider.dart';
 
 void main() {
   testWidgets('Smoke test for Gaze onboarding initialization', (WidgetTester tester) async {
@@ -12,10 +12,8 @@ void main() {
 
     await tester.pumpWidget(
       ProviderScope(
-        overrides: [
-          sharedPreferencesProvider.overrideWithValue(prefs),
-        ],
-        child: const GazeApp(isFirstLaunch: true),
+        overrides: [sharedPreferencesProvider.overrideWithValue(prefs)],
+        child: const App(),
       ),
     );
 

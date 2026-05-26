@@ -1,6 +1,6 @@
 import 'package:riverpod_annotation/riverpod_annotation.dart';
-import '../../../core/platform/platform_channels.dart';
-import '../../settings/presentation/settings_provider.dart';
+import '../../platform/platform_channels.dart';
+import '../../../features/settings/ui/provider/settings_provider.dart';
 
 part 'service_provider.g.dart';
 

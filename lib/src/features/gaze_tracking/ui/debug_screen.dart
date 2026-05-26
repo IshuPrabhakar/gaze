@@ -2,10 +2,12 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:forui/forui.dart';
 import '../../../core/platform/platform_channels.dart';
-import '../presentation/telemetry_provider.dart';
+import 'provider/telemetry_provider.dart';
 
 class DebugScreen extends ConsumerStatefulWidget {
   const DebugScreen({super.key});
+
+  static const String routePath = '/debug';
 
   @override
   ConsumerState<DebugScreen> createState() => _DebugScreenState();
@@ -32,6 +34,7 @@ class _DebugScreenState extends ConsumerState<DebugScreen> {
   @override
   Widget build(BuildContext context) {
     final telemetry = ref.watch(gazeTelemetryProvider);
+    final theme = context.theme;
 
     ref.listen<GazeTelemetryState>(
       gazeTelemetryProvider,
@@ -82,12 +85,15 @@ class _DebugScreenState extends ConsumerState<DebugScreen> {
     );
 
     return Scaffold(
-      backgroundColor: const Color(0xFF0F0F12),
+      backgroundColor: theme.colors.background,
       appBar: AppBar(
-        title: const Text('Realtime Telemetry', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+        title: Text(
+          'Realtime Telemetry',
+          style: theme.typography.lg.copyWith(color: theme.colors.foreground, fontWeight: FontWeight.bold),
+        ),
         backgroundColor: Colors.transparent,
         elevation: 0,
-        iconTheme: const IconThemeData(color: Colors.white),
+        iconTheme: IconThemeData(color: theme.colors.foreground),
       ),
       body: SafeArea(
         child: Padding(
@@ -100,12 +106,12 @@ class _DebugScreenState extends ConsumerState<DebugScreen> {
                 flex: 4,
                 child: Container(
                   decoration: BoxDecoration(
-                    color: const Color(0xFF1E1E24),
-                    borderRadius: BorderRadius.circular(24),
-                    border: Border.all(color: const Color(0xFF2E2E38)),
+                    color: theme.colors.card,
+                    borderRadius: theme.style.borderRadius.lg,
+                    border: Border.all(color: theme.colors.border, width: theme.style.borderWidth),
                   ),
                   child: ClipRRect(
-                    borderRadius: BorderRadius.circular(24),
+                    borderRadius: theme.style.borderRadius.lg,
                     child: Stack(
                       children: [
                         Center(
@@ -115,6 +121,9 @@ class _DebugScreenState extends ConsumerState<DebugScreen> {
                               pitch: telemetry.pitch,
                               eyeOpenness: telemetry.eyeOpenness,
                               isFace: telemetry.isFaceDetected,
+                              primaryColor: theme.colors.primary,
+                              mutedColor: theme.colors.muted,
+                              borderColor: theme.colors.border,
                             ),
                             size: const Size(200, 200),
                           ),
@@ -130,8 +139,8 @@ class _DebugScreenState extends ConsumerState<DebugScreen> {
                             ),
                             child: Text(
                               'SIMULATED CAMERA CORRIDOR',
-                              style: context.theme.typography.xs.copyWith(
-                                color: context.theme.colors.primary,
+                              style: theme.typography.xs.copyWith(
+                                color: theme.colors.primary,
                                 fontWeight: FontWeight.bold,
                                 letterSpacing: 1.0,
                               ),
@@ -203,18 +212,17 @@ class _DebugScreenState extends ConsumerState<DebugScreen> {
                 child: Container(
                   padding: const EdgeInsets.all(16),
                   decoration: BoxDecoration(
-                    color: const Color(0xFF070709),
-                    borderRadius: BorderRadius.circular(16),
-                    border: Border.all(color: const Color(0xFF2E2E38)),
+                    color: theme.colors.muted,
+                    borderRadius: theme.style.borderRadius.lg,
+                    border: Border.all(color: theme.colors.border, width: theme.style.borderWidth),
                   ),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      const Text(
+                      Text(
                         'DIAGNOSTICS LOGS',
-                        style: TextStyle(
-                          color: Color(0xFF6366F1),
-                          fontSize: 11,
+                        style: theme.typography.xs.copyWith(
+                          color: theme.colors.primary,
                           fontWeight: FontWeight.bold,
                           letterSpacing: 1.2,
                         ),
@@ -228,10 +236,9 @@ class _DebugScreenState extends ConsumerState<DebugScreen> {
                               padding: const EdgeInsets.symmetric(vertical: 2.0),
                               child: Text(
                                 _logs[idx],
-                                style: const TextStyle(
+                                style: theme.typography.xs.copyWith(
                                   fontFamily: 'Courier',
-                                  fontSize: 12,
-                                  color: Color(0xFF22C55E),
+                                  color: const Color(0xFF22C55E),
                                 ),
                               ),
                             );
@@ -255,18 +262,24 @@ class FaceTrackerPainter extends CustomPainter {
   final double pitch;
   final double eyeOpenness;
   final bool isFace;
+  final Color primaryColor;
+  final Color mutedColor;
+  final Color borderColor;
 
   FaceTrackerPainter({
     required this.yaw,
     required this.pitch,
     required this.eyeOpenness,
     required this.isFace,
+    required this.primaryColor,
+    required this.mutedColor,
+    required this.borderColor,
   });
 
   @override
   void paint(Canvas canvas, Size size) {
     final paint = Paint()
-      ..color = isFace ? const Color(0xFF6366F1) : Colors.grey[700]!
+      ..color = isFace ? primaryColor : mutedColor
       ..style = PaintingStyle.stroke
       ..strokeWidth = 3.0;
 
@@ -304,7 +317,7 @@ class FaceTrackerPainter extends CustomPainter {
 
       // Draw horizontal crosshairs to represent tracking reference
       final linePaint = Paint()
-        ..color = const Color(0xFF2E2E38)
+        ..color = borderColor
         ..strokeWidth = 1.0;
       canvas.drawLine(Offset(0, centerY), Offset(size.width, centerY), linePaint);
       canvas.drawLine(Offset(centerX, 0), Offset(centerX, size.height), linePaint);

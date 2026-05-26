@@ -27,6 +27,10 @@ import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarker
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarkerResult
 import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.google.mediapipe.tasks.vision.core.ImageProcessingOptions
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import java.io.File
 import java.io.FileOutputStream
 import java.util.concurrent.ExecutorService
@@ -43,19 +47,36 @@ class GazeForegroundService : Service() {
         private const val CHANNEL_ID = "GazeForegroundChannel"
         private const val NOTIFICATION_ID = 4567
 
+        @Volatile
         var isServiceRunning = false
             private set
 
-        // Settings configured from Flutter
+        // Settings configured from Flutter (Thread-visible)
+        @Volatile
         var sensitivity: Float = 0.5f
+        @Volatile
         var scrollSpeed: Float = 1.0f
+        @Volatile
         var triggerDurationMs: Long = 800L
+        @Volatile
         var pauseOnLookAway: Boolean = false
+        @Volatile
         var systemWide: Boolean = true
+        @Volatile
         var enabledApps: List<String> = emptyList()
+        @Volatile
         var swipeMode: String = "eyeTracking"
 
+        // Sensor values for telemetry/fusion (Thread-visible)
+        @Volatile
+        var devicePitchDeg: Float = 0f
+        @Volatile
+        var deviceRollDeg: Float = 0f
+        @Volatile
+        var deviceYawDeg: Float = 0f
+
         // Listeners for gaze telemetry (sent to Flutter overlay/dashboard)
+        @Volatile
         var telemetryListener: ((GazeState) -> Unit)? = null
     }
 
@@ -160,6 +181,10 @@ class GazeForegroundService : Service() {
     private var gazeDownAccum = 0f
     private var gazeUpAccum   = 0f
 
+    // Customized calibration thresholds loaded from SharedPreferences
+    private var customTopThreshold: Float = 0f
+    private var customBottomThreshold: Float = 0f
+
     // ─────────────────────────────────────────────────────────────────────────
     // Scroll timing
     // ─────────────────────────────────────────────────────────────────────────
@@ -174,6 +199,8 @@ class GazeForegroundService : Service() {
     // ─────────────────────────────────────────────────────────────────────────
 
     private var wasAttentiveLastState = true
+    private var lastDevicePitch = 0f
+    private var lastDeviceRoll = 0f
 
     // ─────────────────────────────────────────────────────────────────────────
     // Hand tracking & gesture classification fields
@@ -207,7 +234,7 @@ class GazeForegroundService : Service() {
     private var flagSwipeDown = false
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Camera / MediaPipe infrastructure
+    // Camera / MediaPipe infrastructure & Sensor Fusion / Filtering
     // ─────────────────────────────────────────────────────────────────────────
 
     private lateinit var backgroundExecutor: ExecutorService
@@ -220,11 +247,93 @@ class GazeForegroundService : Service() {
     private var cameraHandler: Handler? = null
 
     private var lastProcessedFrameTime = 0L
-    private val frameThrottleMs = 200L   // ~5 FPS is sufficient for gaze tracking
+    @Volatile
+    private var adaptiveFrameThrottleMs = 33L   // Dynamic: 33ms (30 FPS) active / 200ms (5 FPS) idle
+    private var cachedPixels: IntArray? = null   // Pre-allocated reusable buffer to avoid GC pressure
 
     private var frameCount       = 0
     private var faceCount        = 0
     private var sensorOrientation = 270
+
+    // Sensor Fusion & One Euro Filters
+    private var sensorManager: SensorManager? = null
+    private var rotationVectorSensor: Sensor? = null
+    private var gyroSensor: Sensor? = null
+    private var gyroMagnitude = 0f
+
+    private var filterGazeDown: OneEuroFilter? = null
+    private var filterGazeUp: OneEuroFilter? = null
+    private var filterHeadYaw: OneEuroFilter? = null
+    private var filterHeadPitch: OneEuroFilter? = null
+
+    class OneEuroFilter(
+        val minCutoff: Double,
+        val beta: Double,
+        val dCutoff: Double
+    ) {
+        private var firstTime = true
+        private var xPrev = 0.0
+        private var dxPrev = 0.0
+        private var tPrev = 0L
+
+        fun filter(value: Double, timestampMs: Long): Double {
+            if (firstTime) {
+                firstTime = false
+                xPrev = value
+                dxPrev = 0.0
+                tPrev = timestampMs
+                return value
+            }
+
+            val dt = (timestampMs - tPrev) / 1000.0
+            if (dt <= 0.0) return xPrev
+
+            val dx = (value - xPrev) / dt
+            val alphaD = alpha(dt, dCutoff)
+            val dxSmooth = alphaD * dx + (1.0 - alphaD) * dxPrev
+
+            val cutoff = minCutoff + beta * Math.abs(dxSmooth)
+            val alphaX = alpha(dt, cutoff)
+
+            val xSmooth = alphaX * value + (1.0 - alphaX) * xPrev
+
+            xPrev = xSmooth
+            dxPrev = dxSmooth
+            tPrev = timestampMs
+
+            return xSmooth
+        }
+
+        private fun alpha(dt: Double, cutoff: Double): Double {
+            val tau = 1.0 / (2.0 * Math.PI * cutoff)
+            return dt / (dt + tau)
+        }
+    }
+
+    private val sensorListener = object : SensorEventListener {
+        private val rotationMatrix = FloatArray(9)
+        private val orientationAngles = FloatArray(3)
+
+        override fun onSensorChanged(event: SensorEvent) {
+            when (event.sensor.type) {
+                Sensor.TYPE_ROTATION_VECTOR -> {
+                    SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values)
+                    SensorManager.getOrientation(rotationMatrix, orientationAngles)
+                    deviceYawDeg = Math.toDegrees(orientationAngles[0].toDouble()).toFloat()
+                    devicePitchDeg = Math.toDegrees(orientationAngles[1].toDouble()).toFloat()
+                    deviceRollDeg = Math.toDegrees(orientationAngles[2].toDouble()).toFloat()
+                }
+                Sensor.TYPE_GYROSCOPE -> {
+                    val x = event.values[0]
+                    val y = event.values[1]
+                    val z = event.values[2]
+                    gyroMagnitude = Math.sqrt((x*x + y*y + z*z).toDouble()).toFloat()
+                }
+            }
+        }
+
+        override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+    }
 
     // ─────────────────────────────────────────────────────────────────────────
     // Service lifecycle
@@ -234,6 +343,18 @@ class GazeForegroundService : Service() {
         super.onCreate()
         Log.d(TAG, "GazeForegroundService created")
         backgroundExecutor = Executors.newSingleThreadExecutor()
+        
+        // Setup One Euro Filters
+        filterGazeDown = OneEuroFilter(1.0, 0.01, 1.0)
+        filterGazeUp = OneEuroFilter(1.0, 0.01, 1.0)
+        filterHeadYaw = OneEuroFilter(1.2, 0.015, 1.0)
+        filterHeadPitch = OneEuroFilter(1.2, 0.015, 1.0)
+
+        // Setup Sensor Fusion
+        sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
+        rotationVectorSensor = sensorManager?.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
+        gyroSensor = sensorManager?.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
+
         createNotificationChannel()
         initMediaPipe()
         startBackgroundThread()
@@ -242,8 +363,17 @@ class GazeForegroundService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Log.d(TAG, "GazeForegroundService starting")
         isServiceRunning = true
+        loadPersonalizedProfile(this)
 
         if (cameraThread == null) startBackgroundThread()
+
+        // Register sensors
+        rotationVectorSensor?.let {
+            sensorManager?.registerListener(sensorListener, it, SensorManager.SENSOR_DELAY_UI)
+        }
+        gyroSensor?.let {
+            sensorManager?.registerListener(sensorListener, it, SensorManager.SENSOR_DELAY_UI)
+        }
 
         val notification = createNotification(
             "Gaze Service Active",
@@ -262,6 +392,7 @@ class GazeForegroundService : Service() {
         Log.d(TAG, "GazeForegroundService destroyed")
 
         stopCameraProcessing()
+        sensorManager?.unregisterListener(sensorListener)
 
         isServiceRunning = false
         backgroundExecutor.shutdown()
@@ -399,92 +530,161 @@ class GazeForegroundService : Service() {
             return
         }
 
-        val blendshapesList = blendshapesOptional.get()
-        if (blendshapesList.isEmpty()) {
-            publishGazeState(emptyGazeState())
-            return
-        }
-
         faceCount++
-        val scores = blendshapesList[0].associate { it.categoryName() to it.score() }
+        val scores = blendshapesOptional.get()[0].associate { it.categoryName() to it.score() }
         val face   = landmarks[0]
 
-        // ── 1. Blink / eye-openness ───────────────────────────────────────────
+        // ── 1. Physical Eye Aspect Ratio (EAR) Blink Detection ────────────────
+        // Left eye contours: 33 (outer), 160 (top-outer), 158 (top-inner), 133 (inner), 153 (bottom-inner), 144 (bottom-outer)
+        val lEAR = if (face.size > 160) {
+            val h1 = Math.sqrt(((face[160].x()-face[144].x()).let { it*it } + (face[160].y()-face[144].y()).let { it*it } + (face[160].z()-face[144].z()).let { it*it }).toDouble()).toFloat()
+            val h2 = Math.sqrt(((face[158].x()-face[153].x()).let { it*it } + (face[158].y()-face[153].y()).let { it*it } + (face[158].z()-face[153].z()).let { it*it }).toDouble()).toFloat()
+            val w  = Math.sqrt(((face[33].x()-face[133].x()).let { it*it } + (face[33].y()-face[133].y()).let { it*it } + (face[33].z()-face[133].z()).let { it*it }).toDouble()).toFloat()
+            (h1 + h2) / (2f * w.coerceAtLeast(0.001f))
+        } else 0.25f
+
+        // Right eye contours: 263 (outer), 385 (top-outer), 387 (top-inner), 362 (inner), 373 (bottom-inner), 380 (bottom-outer)
+        val rEAR = if (face.size > 387) {
+            val h1 = Math.sqrt(((face[385].x()-face[380].x()).let { it*it } + (face[385].y()-face[380].y()).let { it*it } + (face[385].z()-face[380].z()).let { it*it }).toDouble()).toFloat()
+            val h2 = Math.sqrt(((face[387].x()-face[373].x()).let { it*it } + (face[387].y()-face[373].y()).let { it*it } + (face[387].z()-face[373].z()).let { it*it }).toDouble()).toFloat()
+            val w  = Math.sqrt(((face[263].x()-face[362].x()).let { it*it } + (face[263].y()-face[362].y()).let { it*it } + (face[263].z()-face[362].z()).let { it*it }).toDouble()).toFloat()
+            (h1 + h2) / (2f * w.coerceAtLeast(0.001f))
+        } else 0.25f
+
+        val avgEAR = (lEAR + rEAR) / 2f
         val leftBlinkScore  = scores["eyeBlinkLeft"]  ?: 0f
         val rightBlinkScore = scores["eyeBlinkRight"] ?: 0f
         val avgBlinkScore   = (leftBlinkScore + rightBlinkScore) / 2f
         val eyeOpenness     = (1f - avgBlinkScore) * 100f
-        val isBlinking      = avgBlinkScore > 0.65f
+        
+        // Dual metric validation: blend shapes + physical EAR to prevent glasses reflections spikes
+        val isBlinking      = (avgBlinkScore * 0.6f + (if (avgEAR < 0.20f) 1.0f else 0.0f) * 0.4f) > 0.60f
 
-        // ── 2. Rotation-invariant head pose estimation ───────────────────────
-        //
-        // ROOT CAUSE OF ±14 YawDev VALUES:
-        // The camera sensor returns a 320×240 LANDSCAPE frame. We pass
-        // sensorOrientation=270 to MediaPipe's ImageProcessingOptions, which
-        // tells MediaPipe to rotate the image internally before detecting
-        // landmarks. After that 270° rotation the frame is portrait, and
-        // landmark XY coordinates live in that rotated space.
-        //
-        // THE FIX — fully rotation-invariant vector projection:
-        // By using face geometry (chin-forehead for vertical, inter-ocular for horizontal)
-        // rather than assuming image orientation, we construct a reliable local coordinate
-        // system that works correctly whether mirrored, unmirrored, rotated, or upside down.
+        // ── 2. True 3D Camera-Space Un-Projection & Head Rotation Matrix R_h ──
+        val lEyeLm = face[33]
+        val rEyeLm = face[263]
+        val iodNormDx = rEyeLm.x() - lEyeLm.x()
+        val iodNormDy = rEyeLm.y() - lEyeLm.y()
+        val iodNorm = Math.sqrt((iodNormDx * iodNormDx + iodNormDy * iodNormDy).toDouble()).toFloat().coerceAtLeast(0.01f)
+        
+        // Estimate physical camera distance using average physical IOD (70mm) and front-camera focal approximation (f=280)
+        val zCenter = (280f * 70f) / (iodNorm * 320f)
 
-        // ── Key landmarks ────────────────────────────────────────────────────
-        val lEyeX = face[33].x();  val lEyeY = face[33].y()   // user's left eye
-        val rEyeX = face[263].x(); val rEyeY = face[263].y()  // user's right eye
-        val noseX = face[1].x();   val noseY = face[1].y()    // nose tip (canonical)
-        val chinX = face[152].x(); val chinY = face[152].y()  // chin bottom
-        val foreX = face[10].x();  val foreY = face[10].y()   // forehead top
+        // Helper function to unproject normalized MediaPipe coordinates into millimeter metric camera space
+        fun get3DPoint(idx: Int): FloatArray {
+            val lm = face[idx]
+            val zPhysical = zCenter + lm.z() * 70f
+            val xPhysical = (lm.x() - 0.5f) * 320f * zPhysical / 280f
+            val yPhysical = (lm.y() - 0.5f) * 240f * zPhysical / 280f
+            return floatArrayOf(xPhysical, yPhysical, zPhysical)
+        }
 
-        // ── Inter-ocular distance (scale reference) ───────────────────────────
-        val iodDx = rEyeX - lEyeX
-        val iodDy = rEyeY - lEyeY
-        val iod   = Math.sqrt((iodDx * iodDx + iodDy * iodDy).toDouble()).toFloat()
+        val p33 = get3DPoint(33)     // Left Eye Outer
+        val p263 = get3DPoint(263)   // Right Eye Outer
+        val p10 = get3DPoint(10)     // Forehead
+        val p152 = get3DPoint(152)   // Chin
+        val p133 = get3DPoint(133)   // Left Eye Inner
+        val p362 = get3DPoint(362)   // Right Eye Inner
 
-        // Also compute chin-forehead distance for a secondary scale check
-        val cfDx = chinX - foreX
-        val cfDy = chinY - foreY
-        val cf   = Math.sqrt((cfDx * cfDx + cfDy * cfDy).toDouble()).toFloat()
+        val uxDx = p263[0] - p33[0]
+        val uxDy = p263[1] - p33[1]
+        val uxDz = p263[2] - p33[2]
+        val uxLen = Math.sqrt((uxDx * uxDx + uxDy * uxDy + uxDz * uxDz).toDouble()).toFloat().coerceAtLeast(0.001f)
+        val ux = floatArrayOf(uxDx / uxLen, uxDy / uxLen, uxDz / uxLen)
 
-        // Guard: if the face geometry is degenerate, skip this frame
-        if (iod < 0.02f || cf < 0.02f) return
+        val uyRawDx = p10[0] - p152[0]
+        val uyRawDy = p10[1] - p152[1]
+        val uyRawDz = p10[2] - p152[2]
+        val uyRawLen = Math.sqrt((uyRawDx * uyRawDx + uyRawDy * uyRawDy + uyRawDz * uyRawDz).toDouble()).toFloat().coerceAtLeast(0.001f)
+        val uyRaw = floatArrayOf(uyRawDx / uyRawLen, uyRawDy / uyRawLen, uyRawDz / uyRawLen)
 
-        // ── Face vertical axis (pointing down from forehead to chin) ─────────
-        val faceDownX = cfDx / cf
-        val faceDownY = cfDy / cf
+        // Orthonormal Z axis via cross product (Z = X cross Y)
+        val uz = floatArrayOf(
+            ux[1]*uyRaw[2] - ux[2]*uyRaw[1],
+            ux[2]*uyRaw[0] - ux[0]*uyRaw[2],
+            ux[0]*uyRaw[1] - ux[1]*uyRaw[0]
+        )
+        val lenZ = Math.sqrt((uz[0]*uz[0] + uz[1]*uz[1] + uz[2]*uz[2]).toDouble()).toFloat().coerceAtLeast(0.001f)
+        uz[0] /= lenZ; uz[1] /= lenZ; uz[2] /= lenZ
 
-        // ── Face horizontal axis (pointing from user's left eye to right eye) ─
-        val faceRightX = iodDx / iod
-        val faceRightY = iodDy / iod
+        // Perfect orthogonal Y axis (Y = Z cross X)
+        val uy = floatArrayOf(
+            uz[1]*ux[2] - uz[2]*ux[1],
+            uz[2]*ux[0] - uz[0]*ux[2],
+            uz[0]*ux[1] - uz[1]*ux[0]
+        )
 
-        // ── Eye midpoint ─────────────────────────────────────────────────────
-        val eyeMidX = (lEyeX + rEyeX) / 2f
-        val eyeMidY = (lEyeY + rEyeY) / 2f
+        // R_h transpose values for inverse vector rotation (decouples head rotation)
+        val r00 = ux[0]; val r01 = ux[1]; val r02 = ux[2]
+        val r10 = uy[0]; val r11 = uy[1]; val r12 = uy[2]
+        val r20 = uz[0]; val r21 = uz[1]; val r22 = uz[2]
 
-        // ── Nose-tip displacement from eye midpoint ───────────────────────────
-        val dNoseX = noseX - eyeMidX
-        val dNoseY = noseY - eyeMidY
+        // ── 3. 3D Eyeball Vector and Canonical Gaze Normalization ────────────
+        val lEyeCenter3D = floatArrayOf((p33[0] + p133[0]) / 2f, (p33[1] + p133[1]) / 2f, (p33[2] + p133[2]) / 2f)
+        val rEyeCenter3D = floatArrayOf((p263[0] + p362[0]) / 2f, (p263[1] + p362[1]) / 2f, (p263[2] + p362[2]) / 2f)
 
-        // ── Project onto face axes, normalise by IOD ─────────────────────────
-        // headYaw   > 0 → face turned toward user's right (look right)
-        // headPitch > 0 → nose tip moved towards chin → face tilted down
-        val headYaw   = (dNoseX * faceRightX + dNoseY * faceRightY) / iod
-        val headPitch = (dNoseX * faceDownX + dNoseY * faceDownY) / iod
+        // Iris centers (468 left, 473 right)
+        val hasIris = face.size > 473
+        val lPupil3D = if (hasIris) get3DPoint(468) else p33
+        val rPupil3D = if (hasIris) get3DPoint(473) else p263
 
-        // ── 3. Dynamic baseline — FIX A ──────────────────────────────────────
-        //
-        // PROBLEM (original): A single hardcoded pitchBaseline = 0.15f cannot
-        //   account for different phone-holding angles or user postures.  The
-        //   0.99/0.01 drift was also fast enough to silently absorb intentional
-        //   gestures before they triggered an action.
-        //
-        // FIX: Two-phase approach:
-        //   • Warm-up (first N frames): running average so the baseline is
-        //     seeded from the user's actual natural posture, not a constant.
-        //   • Post-warmup: very slow drift (0.995) so gradual posture changes
-        //     (slouching, phone tilt) are tracked without swallowing short
-        //     intentional gestures (~300–800 ms).
+        val lGazeRaw = floatArrayOf(lPupil3D[0] - lEyeCenter3D[0], lPupil3D[1] - lEyeCenter3D[1], lPupil3D[2] - lEyeCenter3D[2])
+        val rGazeRaw = floatArrayOf(rPupil3D[0] - rEyeCenter3D[0], rPupil3D[1] - rEyeCenter3D[1], rPupil3D[2] - rEyeCenter3D[2])
+
+        // Rotate 3D gaze vector into canonical eyeball head space via R_h^T
+        val lGazeCanonical = floatArrayOf(
+            r00 * lGazeRaw[0] + r01 * lGazeRaw[1] + r02 * lGazeRaw[2],
+            r10 * lGazeRaw[0] + r11 * lGazeRaw[1] + r12 * lGazeRaw[2],
+            r20 * lGazeRaw[0] + r21 * lGazeRaw[1] + r22 * lGazeRaw[2]
+        )
+        val rGazeCanonical = floatArrayOf(
+            r00 * rGazeRaw[0] + r01 * rGazeRaw[1] + r02 * rGazeRaw[2],
+            r10 * rGazeRaw[0] + r11 * rGazeRaw[1] + r12 * rGazeRaw[2],
+            r20 * rGazeRaw[0] + r21 * rGazeRaw[1] + r22 * rGazeRaw[2]
+        )
+
+        // Project nose-tip to measure head yaw/pitch in physical millimeters
+        val p1 = get3DPoint(1) // Nose Tip
+        val eyeMid = floatArrayOf((p33[0] + p263[0]) / 2f, (p33[1] + p263[1]) / 2f, (p33[2] + p263[2]) / 2f)
+        val dNoseX = p1[0] - eyeMid[0]
+        val dNoseY = p1[1] - eyeMid[1]
+        val dNoseZ = p1[2] - eyeMid[2]
+
+        val iodMetric = Math.sqrt(((p263[0]-p33[0])*(p263[0]-p33[0]) + (p263[1]-p33[1])*(p263[1]-p33[1]) + (p263[2]-p33[2])*(p263[2]-p33[2])).toDouble()).toFloat().coerceAtLeast(1f)
+        
+        val headYaw   = (dNoseX * ux[0] + dNoseY * ux[1] + dNoseZ * ux[2]) / iodMetric
+        val headPitch = (dNoseX * uy[0] + dNoseY * uy[1] + dNoseZ * uy[2]) / iodMetric
+
+        // ── 4. Device Sensor Fusion & Gravity Roll Compensation ──────────────
+        val pitchShift = Math.abs(devicePitchDeg - lastDevicePitch)
+        val rollShift = Math.abs(deviceRollDeg - lastDeviceRoll)
+        if (pitchShift > 12f || rollShift > 12f) {
+            baselineInitialized = false
+            baselineSampleCount = 0
+            gazeBaselineReady = false
+            gazeDownAccum = 0f
+            gazeUpAccum = 0f
+            Log.i(TAG, "Sensor Fusion: Dynamic baseline recalibration triggered by posture shift (pitchShift=$pitchShift, rollShift=$rollShift)")
+        }
+        lastDevicePitch = devicePitchDeg
+        lastDeviceRoll = deviceRollDeg
+
+        // Rotate canonical gaze vector around Z-axis by device roll to counteract phone tilt/lying down
+        val rollRad = Math.toRadians(deviceRollDeg.toDouble()).toFloat()
+        val cosR = Math.cos(rollRad.toDouble()).toFloat()
+        val sinR = Math.sin(rollRad.toDouble()).toFloat()
+
+        val lGazeFused = floatArrayOf(
+            lGazeCanonical[0] * cosR - lGazeCanonical[1] * sinR,
+            lGazeCanonical[0] * sinR + lGazeCanonical[1] * cosR,
+            lGazeCanonical[2]
+        )
+        val rGazeFused = floatArrayOf(
+            rGazeCanonical[0] * cosR - rGazeCanonical[1] * sinR,
+            rGazeCanonical[0] * sinR + rGazeCanonical[1] * cosR,
+            rGazeCanonical[2]
+        )
+
         if (!baselineInitialized) {
             val n = baselineSampleCount.toFloat()
             yawBaseline   = yawBaseline   * (n / (n + 1f)) + headYaw   * (1f / (n + 1f))
@@ -498,7 +698,6 @@ class GazeForegroundService : Service() {
                            "Pitch: ${"%.4f".format(pitchBaseline)}")
             }
 
-            // Do not emit gesture signals during warm-up; publish face-present state only.
             publishGazeState(
                 GazeState(
                     isFaceDetected = true, isAttentive = false,
@@ -516,79 +715,80 @@ class GazeForegroundService : Service() {
         val yawDev   = headYaw   - yawBaseline
         val pitchDev = headPitch - pitchBaseline
 
-        // ── 4. Attention gate ────────────────────────────────────────────────
-        // Attention gate: thresholds are in IOD-normalised units.
-        // ~20° yaw turn  ≈ 0.17 IOD; ~12° pitch tilt ≈ 0.10 IOD.
-        // We use slightly generous values so normal reading posture stays "attentive".
-        val isAttentive = Math.abs(yawDev) < 0.20f && Math.abs(pitchDev) < 0.15f
+        // ── 5. Motion-Aware Confidence Scoring ────────────────────────────────
+        val motionPenalty = (gyroMagnitude * 0.08f).coerceAtMost(0.4f)
+        val poseAnglePenalty = (Math.abs(headYaw) * 0.4f + Math.abs(headPitch) * 0.4f).coerceAtMost(0.3f)
+        val gazeConfidence = (1.0f - motionPenalty - poseAnglePenalty).coerceIn(0f, 1f)
 
-        // ── 5. Eye-gaze blendshapes — baseline-subtracted relative scores ────
-        //
-        // ROOT CAUSE of LookDown=true at rest:
-        //   MediaPipe's eyeLookDownLeft/Right blendshapes have a person- and
-        //   device-specific resting value.  In these logs SmDown=0.55 while
-        //   the user is just holding the phone normally — the absolute score
-        //   permanently exceeds every threshold we set.
-        //
-        // THE FIX — treat blendshapes exactly like head pose:
-        //   • During the same warm-up window, accumulate the average resting
-        //     score for each direction.  This becomes the "neutral gaze" baseline.
-        //   • After warm-up, work with RELATIVE scores (raw − baseline).
-        //     At rest the relative score is ≈ 0.  A genuine look-down adds
-        //     +0.15 to +0.35 on top of that resting value.
-        //   • The relative scores drift slowly (0.995 rate) to follow gradual
-        //     changes (fatigue, lighting) without absorbing quick intentional
-        //     gestures.
-        //   • All thresholds are now relative, so they mean the same thing
-        //     for every user regardless of their resting blendshape offset.
-        val rawGazeDown = ((scores["eyeLookDownLeft"]  ?: 0f) + (scores["eyeLookDownRight"] ?: 0f)) / 2f
-        val rawGazeUp   = ((scores["eyeLookUpLeft"]    ?: 0f) + (scores["eyeLookUpRight"]   ?: 0f)) / 2f
+        // ── 6. Attention gate ────────────────────────────────────────────────
+        val isAttentive = Math.abs(yawDev) < 0.20f && Math.abs(pitchDev) < 0.15f && gazeConfidence > 0.60f
 
-        // Accumulate baseline during head-pose warm-up (they share the same window)
-        if (!gazeBaselineReady) {
+        // Dynamically adjust Camera FPS throttling (30 FPS when active, 5 FPS when idle/face lost)
+        adaptiveFrameThrottleMs = if (isAttentive) 33L else 200L
+
+        // ── 7. Canonical Gaze Extraction & One Euro Filtering ────────────────
+        // Calculate physical eye width to normalize metric displacement into a scale-invariant ratio
+        val lEyeWidth = Math.sqrt(((p33[0]-p133[0])*(p33[0]-p133[0]) + (p33[1]-p133[1])*(p33[1]-p133[1]) + (p33[2]-p133[2])*(p33[2]-p133[2])).toDouble()).toFloat().coerceAtLeast(1f)
+        val rEyeWidth = Math.sqrt(((p263[0]-p362[0])*(p263[0]-p362[0]) + (p263[1]-p362[1])*(p263[1]-p362[1]) + (p263[2]-p362[2])*(p263[2]-p362[2])).toDouble()).toFloat().coerceAtLeast(1f)
+        val avgEyeWidth = (lEyeWidth + rEyeWidth) / 2f
+
+        val canonicalEyeY = ((lGazeFused[1] + rGazeFused[1]) / 2f) / avgEyeWidth * 1.8f
+        
+        // Relativize against dynamic gaze baseline offsets
+        val rawGazeDown = (-canonicalEyeY).coerceAtLeast(0f)
+        val rawGazeUp   = canonicalEyeY.coerceAtLeast(0f)
+
+         if (!gazeBaselineReady) {
             gazeDownAccum += rawGazeDown
             gazeUpAccum   += rawGazeUp
-            // baselineSampleCount is incremented in section 3; mirror its readiness
             if (baselineInitialized) {
-                // Head-pose warm-up just finished — finalise gaze baselines
                 gazeDownBaseline  = gazeDownAccum / baselineWarmupFrames.toFloat()
                 gazeUpBaseline    = gazeUpAccum   / baselineWarmupFrames.toFloat()
                 gazeBaselineReady = true
-                Log.i(TAG, "Gaze baseline ready — Down: ${"%.3f".format(gazeDownBaseline)}" +
-                           " Up: ${"%.3f".format(gazeUpBaseline)}")
+                
+                // Instantly reset smoothed state and One Euro filters to avoid warmup decay lag
+                smoothedGazeDown  = 0f
+                smoothedGazeUp    = 0f
+                filterGazeDown    = OneEuroFilter(1.0, 0.01, 1.0)
+                filterGazeUp      = OneEuroFilter(1.0, 0.01, 1.0)
+                
+                Log.i(TAG, "Gaze baseline ready — Down: ${"%.3f".format(gazeDownBaseline)} Up: ${"%.3f".format(gazeUpBaseline)}")
             }
-            // During warm-up emit no gesture signals (head-pose section already returned)
         } else {
-            // Slow drift to track gradual fatigue / lighting changes
             gazeDownBaseline = gazeDownBaseline * baselineDriftRate + rawGazeDown * (1f - baselineDriftRate)
             gazeUpBaseline   = gazeUpBaseline   * baselineDriftRate + rawGazeUp   * (1f - baselineDriftRate)
         }
 
-        // Relative scores: how much above the personal resting value is the eye signal?
         val relGazeDown = (rawGazeDown - gazeDownBaseline).coerceAtLeast(0f)
         val relGazeUp   = (rawGazeUp   - gazeUpBaseline  ).coerceAtLeast(0f)
 
-        // Smooth the relative scores to suppress single-frame noise
-        smoothedGazeDown = smoothedGazeDown * gazeSmoothing + relGazeDown * (1f - gazeSmoothing)
-        smoothedGazeUp   = smoothedGazeUp   * gazeSmoothing + relGazeUp   * (1f - gazeSmoothing)
+        // Smooth relative scores and deviations using our high-velocity One Euro Filters
+        val now = System.currentTimeMillis()
+        val filteredYawDev = filterHeadYaw?.filter(yawDev.toDouble(), now)?.toFloat() ?: yawDev
+        val filteredPitchDev = filterHeadPitch?.filter(pitchDev.toDouble(), now)?.toFloat() ?: pitchDev
 
-        // Thresholds are now in RELATIVE units (delta above resting).
-        // A deliberate look-down adds roughly +0.15–0.35; use 0.12 as the bar
-        // so there is comfortable headroom above noise (~0.02–0.05 relative).
-        val lookThreshold    = 0.12f - (sensitivity * 0.06f)   // range: 0.06–0.12
-        val eyeSignalMinimum = lookThreshold * 0.70f            // eye must provide 70% on its own
+        val filteredGazeDown = filterGazeDown?.filter(relGazeDown.toDouble(), now)?.toFloat() ?: relGazeDown
+        val filteredGazeUp = filterGazeUp?.filter(relGazeUp.toDouble(), now)?.toFloat() ?: relGazeUp
 
-        // Pitch deviation can assist but not alone trigger (small weight, correct sign only)
-        val pitchDownAssist = pitchDev.coerceAtLeast(0f) * 0.3f
-        val pitchUpAssist   = (-pitchDev).coerceAtLeast(0f) * 0.3f
+        smoothedGazeDown = smoothedGazeDown * gazeSmoothing + filteredGazeDown * (1f - gazeSmoothing)
+        smoothedGazeUp   = smoothedGazeUp   * gazeSmoothing + filteredGazeUp   * (1f - gazeSmoothing)
+
+        val lookThresholdDown = if (customBottomThreshold != 0f) Math.abs(customBottomThreshold) else (0.12f - (sensitivity * 0.06f))
+        val lookThresholdUp   = if (customTopThreshold != 0f) Math.abs(customTopThreshold) else (0.12f - (sensitivity * 0.06f))
+
+        val eyeSignalMinimumDown = lookThresholdDown * 0.70f
+        val eyeSignalMinimumUp   = lookThresholdUp * 0.70f
+
+        val pitchDownAssist = filteredPitchDev.coerceAtLeast(0f) * 0.3f
+        val pitchUpAssist   = (-filteredPitchDev).coerceAtLeast(0f) * 0.3f
 
         val isLookingDown = gazeBaselineReady && isAttentive
-                && smoothedGazeDown >= eyeSignalMinimum
-                && (smoothedGazeDown + pitchDownAssist) >= lookThreshold
+                && smoothedGazeDown >= eyeSignalMinimumDown
+                && (smoothedGazeDown + pitchDownAssist) >= lookThresholdDown
 
         val isLookingUp = gazeBaselineReady && isAttentive
-                && smoothedGazeUp >= eyeSignalMinimum
-                && (smoothedGazeUp + pitchUpAssist) >= lookThreshold
+                && smoothedGazeUp >= eyeSignalMinimumUp
+                && (smoothedGazeUp + pitchUpAssist) >= lookThresholdUp
 
         // ── 6. Head-nod detection — FIX C ────────────────────────────────────
         //
@@ -603,7 +803,7 @@ class GazeForegroundService : Service() {
         //     within nodMaxDurationMs.  Movements held longer than that are
         //     treated as sustained posture changes, not nods.
         //   • Re-arms only after deviation fully returns to near-neutral.
-        val now = System.currentTimeMillis()
+        // Re-use already declared 'now' timestamp for head-nod checks
 
         // Nod thresholds in IOD-normalised units.
         // A small but deliberate nod moves ~0.06–0.10 IOD units.
@@ -708,13 +908,15 @@ class GazeForegroundService : Service() {
             val us  = "%.3f".format(smoothedGazeUp   + pitchUpAssist)
             val db  = "%.3f".format(gazeDownBaseline)
             val ub  = "%.3f".format(gazeUpBaseline)
-            val thr = "%.3f".format(lookThreshold)
-            val em  = "%.3f".format(eyeSignalMinimum)
-            val iodStr = "%.4f".format(iod)
+            val thrD = "%.3f".format(lookThresholdDown)
+            val thrU = "%.3f".format(lookThresholdUp)
+            val emD  = "%.3f".format(eyeSignalMinimumDown)
+            val emU  = "%.3f".format(eyeSignalMinimumUp)
+            val iodStr = "%.4f".format(iodNorm)
             Log.d(TAG,
                 "Gaze | IOD=$iodStr PitchDev=$pd YawDev=$yd | " +
                 "RelDown=$sd(base=$db) RelUp=$su(base=$ub) | " +
-                "DownScore=$ds UpScore=$us | Thresh=$thr EyeMin=$em | " +
+                "DownScore=$ds UpScore=$us | ThreshD=$thrD ThreshU=$thrU EyeMinD=$emD EyeMinU=$emU | " +
                 "LookDown=$isLookingDown LookUp=$isLookingUp Attentive=$isAttentive"
             )
         }
@@ -1177,7 +1379,7 @@ class GazeForegroundService : Service() {
 
     private fun processCameraImage(image: Image) {
         val now = SystemClock.uptimeMillis()
-        if (now - lastProcessedFrameTime < frameThrottleMs) {
+        if (now - lastProcessedFrameTime < adaptiveFrameThrottleMs) {
             image.close(); return
         }
         lastProcessedFrameTime = now
@@ -1213,25 +1415,33 @@ class GazeForegroundService : Service() {
         val w = image.width
         val h = image.height
 
-        val pixels = IntArray(w * h)
+        // Pre-allocated array cache optimization (production grade)
+        val size = w * h
+        if (cachedPixels == null || cachedPixels!!.size != size) {
+            cachedPixels = IntArray(size)
+        }
+        val pixels = cachedPixels!!
 
         for (y in 0 until h) {
             val yRowOff  = y * yRowStride
             val uvRowIdx = y shr 1
             val uRowOff  = uvRowIdx * uRowStride
             val vRowOff  = uvRowIdx * vRowStride
+            val pixelRowOff = y * w
 
             for (x in 0 until w) {
                 val uvColIdx = x shr 1
+                val uOffset = uRowOff + uvColIdx * uPixStride
+                val vOffset = vRowOff + uvColIdx * vPixStride
                 val yv = yBuffer.get(yRowOff + x).toInt() and 0xFF
-                val uv = (uBuffer.get(uRowOff + uvColIdx * uPixStride).toInt() and 0xFF) - 128
-                val vv = (vBuffer.get(vRowOff + uvColIdx * vPixStride).toInt() and 0xFF) - 128
+                val uv = (uBuffer.get(uOffset).toInt() and 0xFF) - 128
+                val vv = (vBuffer.get(vOffset).toInt() and 0xFF) - 128
 
                 val r = (yv + 1.402f  * vv).toInt().coerceIn(0, 255)
                 val g = (yv - 0.34414f * uv - 0.71414f * vv).toInt().coerceIn(0, 255)
                 val b = (yv + 1.772f  * uv).toInt().coerceIn(0, 255)
 
-                pixels[y * w + x] = 0xFF000000.toInt() or (r shl 16) or (g shl 8) or b
+                pixels[pixelRowOff + x] = 0xFF000000.toInt() or (r shl 16) or (g shl 8) or b
             }
         }
 
@@ -1313,5 +1523,34 @@ class GazeForegroundService : Service() {
         }
 
         simulatorHandler?.post(runnable)
+    }
+
+    private fun loadPersonalizedProfile(context: Context) {
+        try {
+            val prefs = context.getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
+            val profileJson = prefs.getString("flutter.user_calibration_profile", null)
+            if (profileJson != null) {
+                val json = org.json.JSONObject(profileJson)
+                val neutralVec = json.getJSONArray("neutral_vector")
+                val neutralX = neutralVec.getDouble(0).toFloat()
+                val neutralY = neutralVec.getDouble(1).toFloat()
+
+                yawBaseline = neutralX
+                pitchBaseline = neutralY
+                baselineInitialized = true
+
+                customTopThreshold = json.optDouble("top_threshold", 0.08).toFloat()
+                customBottomThreshold = json.optDouble("bottom_threshold", -0.08).toFloat()
+
+                // Instantly seed dynamic gaze baselines and ready states
+                gazeDownBaseline = 0f
+                gazeUpBaseline = 0f
+                gazeBaselineReady = true
+
+                Log.i(TAG, "Loaded active custom baseline calibration: neutralX=$neutralX neutralY=$neutralY top=$customTopThreshold bottom=$customBottomThreshold")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to load personalized calibration baseline: ${e.message}")
+        }
     }
 }

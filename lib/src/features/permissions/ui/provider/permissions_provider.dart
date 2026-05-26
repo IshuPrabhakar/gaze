@@ -1,5 +1,5 @@
 import 'package:riverpod_annotation/riverpod_annotation.dart';
-import '../../../core/platform/platform_channels.dart';
+import '../../../../core/platform/platform_channels.dart';
 
 import 'package:permission_handler/permission_handler.dart';
 

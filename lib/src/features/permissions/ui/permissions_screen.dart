@@ -2,10 +2,12 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:forui/forui.dart';
 import 'package:go_router/go_router.dart';
-import 'permissions_provider.dart';
+import 'provider/permissions_provider.dart';
 
 class PermissionsScreen extends ConsumerStatefulWidget {
   const PermissionsScreen({super.key});
+
+  static const String routePath = '/permissions';
 
   @override
   ConsumerState<PermissionsScreen> createState() => _PermissionsScreenState();
@@ -37,17 +39,18 @@ class _PermissionsScreenState extends ConsumerState<PermissionsScreen> with Widg
   @override
   Widget build(BuildContext context) {
     final state = ref.watch(permissionsProvider);
+    final theme = context.theme;
 
     return Scaffold(
-      backgroundColor: const Color(0xFF0F0F12),
+      backgroundColor: theme.colors.background,
       appBar: AppBar(
-        title: const Text(
+        title: Text(
           'Required Permissions',
-          style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+          style: theme.typography.lg.copyWith(color: theme.colors.foreground, fontWeight: FontWeight.bold),
         ),
         backgroundColor: Colors.transparent,
         elevation: 0,
-        iconTheme: const IconThemeData(color: Colors.white),
+        iconTheme: IconThemeData(color: theme.colors.foreground),
       ),
       body: SafeArea(
         child: Padding(
@@ -57,22 +60,22 @@ class _PermissionsScreenState extends ConsumerState<PermissionsScreen> with Widg
             children: [
               Text(
                 'Setup Gaze scrolling',
-                style: TextStyle(
-                  fontSize: 20,
+                style: theme.typography.xl.copyWith(
                   fontWeight: FontWeight.w600,
-                  color: Colors.grey[300],
+                  color: theme.colors.foreground,
                 ),
               ),
               const SizedBox(height: 8),
               Text(
                 'Configure your Android device permissions to enable hands-free tracking and gesture simulation.',
-                style: TextStyle(fontSize: 14, color: Colors.grey[400], height: 1.4),
+                style: theme.typography.sm.copyWith(color: theme.colors.mutedForeground),
               ),
               const SizedBox(height: 32),
               Expanded(
                 child: ListView(
                   children: [
                     _buildPermissionCard(
+                      context,
                       icon: Icons.camera_alt_rounded,
                       title: 'Camera Access',
                       description:
@@ -82,6 +85,7 @@ class _PermissionsScreenState extends ConsumerState<PermissionsScreen> with Widg
                     ),
                     const SizedBox(height: 16),
                     _buildPermissionCard(
+                      context,
                       icon: Icons.accessibility_new_rounded,
                       title: 'Accessibility Service',
                       description:
@@ -91,6 +95,7 @@ class _PermissionsScreenState extends ConsumerState<PermissionsScreen> with Widg
                     ),
                     const SizedBox(height: 16),
                     _buildPermissionCard(
+                      context,
                       icon: Icons.filter_none_rounded,
                       title: 'Overlay Permission',
                       description:
@@ -100,6 +105,7 @@ class _PermissionsScreenState extends ConsumerState<PermissionsScreen> with Widg
                     ),
                     const SizedBox(height: 16),
                     _buildPermissionCard(
+                      context,
                       icon: Icons.battery_saver_rounded,
                       title: 'Battery Optimization Exemption',
                       description:
@@ -119,12 +125,11 @@ class _PermissionsScreenState extends ConsumerState<PermissionsScreen> with Widg
               ),
               const SizedBox(height: 8),
               if (!state.allGranted)
-                const Text(
+                Text(
                   'Please grant all required permissions to continue.',
                   textAlign: TextAlign.center,
-                  style: TextStyle(
-                    fontSize: 12,
-                    color: Color(0xFFA855F7),
+                  style: theme.typography.xs.copyWith(
+                    color: theme.colors.primary,
                     fontWeight: FontWeight.w500,
                   ),
                 ),
@@ -135,20 +140,23 @@ class _PermissionsScreenState extends ConsumerState<PermissionsScreen> with Widg
     );
   }
 
-  Widget _buildPermissionCard({
+  Widget _buildPermissionCard(
+    BuildContext context, {
     required IconData icon,
     required String title,
     required String description,
     required bool isGranted,
     required VoidCallback onGrant,
   }) {
+    final theme = context.theme;
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
-        color: const Color(0xFF1E1E24),
-        borderRadius: BorderRadius.circular(16),
+        color: theme.colors.card,
+        borderRadius: theme.style.borderRadius.lg,
         border: Border.all(
-          color: isGranted ? const Color(0xFF22C55E).withValues(alpha: 0.3) : const Color(0xFF2E2E38),
+          color: isGranted ? const Color(0xFF22C55E).withValues(alpha: 0.3) : theme.colors.border,
+          width: theme.style.borderWidth,
         ),
       ),
       child: Row(
@@ -159,12 +167,12 @@ class _PermissionsScreenState extends ConsumerState<PermissionsScreen> with Widg
             decoration: BoxDecoration(
               color: isGranted
                   ? const Color(0xFF22C55E).withValues(alpha: 0.1)
-                  : const Color(0xFF6366F1).withValues(alpha: 0.1),
+                  : theme.colors.primary.withValues(alpha: 0.1),
               shape: BoxShape.circle,
             ),
             child: Icon(
               icon,
-              color: isGranted ? const Color(0xFF22C55E) : const Color(0xFF6366F1),
+              color: isGranted ? const Color(0xFF22C55E) : theme.colors.primary,
               size: 20,
             ),
           ),
@@ -178,10 +186,9 @@ class _PermissionsScreenState extends ConsumerState<PermissionsScreen> with Widg
                     Expanded(
                       child: Text(
                         title,
-                        style: const TextStyle(
-                          fontSize: 15,
+                        style: theme.typography.sm.copyWith(
                           fontWeight: FontWeight.bold,
-                          color: Colors.white,
+                          color: theme.colors.foreground,
                         ),
                       ),
                     ),
@@ -205,7 +212,7 @@ class _PermissionsScreenState extends ConsumerState<PermissionsScreen> with Widg
                 const SizedBox(height: 6),
                 Text(
                   description,
-                  style: TextStyle(fontSize: 13, color: Colors.grey[400], height: 1.3),
+                  style: theme.typography.xs.copyWith(color: theme.colors.mutedForeground),
                 ),
                 if (!isGranted) ...[
                   const SizedBox(height: 12),

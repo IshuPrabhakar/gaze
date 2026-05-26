@@ -1,7 +1,7 @@
 import 'package:riverpod_annotation/riverpod_annotation.dart';
-import '../../../core/services/shared_preferences_provider.dart';
-import '../../../core/platform/platform_channels.dart';
-import '../domain/settings_state.dart';
+import '../../../../core/services/shared_preferences_provider.dart';
+import '../../../../core/platform/platform_channels.dart';
+import '../state/settings_state.dart';
 
 part 'settings_provider.g.dart';
 
