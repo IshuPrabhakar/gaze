@@ -1,7 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:go_router/go_router.dart';
 import 'package:forui/forui.dart';
+import 'package:go_router/go_router.dart';
+
 import 'provider/settings_provider.dart';
 
 class SettingsScreen extends ConsumerWidget {
@@ -20,7 +21,10 @@ class SettingsScreen extends ConsumerWidget {
       appBar: AppBar(
         title: Text(
           'Calibration & Settings',
-          style: theme.typography.lg.copyWith(color: theme.colors.foreground, fontWeight: FontWeight.bold),
+          style: theme.typography.lg.copyWith(
+            color: theme.colors.foreground,
+            fontWeight: FontWeight.bold,
+          ),
         ),
         backgroundColor: Colors.transparent,
         elevation: 0,
@@ -34,7 +38,8 @@ class SettingsScreen extends ConsumerWidget {
               _buildSettingCard(
                 context,
                 title: 'Personalized Eye Calibration',
-                subtitle: 'Train the eye-tracking system to recognize your unique range of eye motion and posture.',
+                subtitle:
+                    'Train the eye-tracking system to recognize your unique range of eye motion and posture.',
                 child: Row(
                   children: [
                     Expanded(
@@ -59,7 +64,8 @@ class SettingsScreen extends ConsumerWidget {
               _buildSettingCard(
                 context,
                 title: 'Gaze Sensitivity: ${(settings.sensitivity * 100).toInt()}%',
-                subtitle: 'Determines facial threshold pitch angle needed to trigger look downward action.',
+                subtitle:
+                    'Determines facial threshold pitch angle needed to trigger look downward action.',
                 child: Slider(
                   value: settings.sensitivity,
                   min: 0.1,
@@ -73,7 +79,8 @@ class SettingsScreen extends ConsumerWidget {
               _buildSettingCard(
                 context,
                 title: 'Scroll Velocity: ${(settings.scrollSpeed * 100).toInt()}%',
-                subtitle: 'Configures speed / swiping stroke duration for accessibility dispatching.',
+                subtitle:
+                    'Configures speed / swiping stroke duration for accessibility dispatching.',
                 child: Slider(
                   value: settings.scrollSpeed,
                   min: 0.2,
@@ -87,7 +94,8 @@ class SettingsScreen extends ConsumerWidget {
               _buildSettingCard(
                 context,
                 title: 'Interaction Control Mode',
-                subtitle: 'Choose how vertical swipes are triggered. Horizontal swipes always respond to left/right nods.',
+                subtitle:
+                    'Choose how vertical swipes are triggered. Horizontal swipes always respond to left/right nods.',
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
@@ -95,11 +103,8 @@ class SettingsScreen extends ConsumerWidget {
                       children: [
                         Expanded(
                           child: ChoiceChip(
-                            label: const Center(
-                              child: Text(
-                                'Eye Gaze',
-                                style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 10),
-                              ),
+                            label: Center(
+                              child: Text('Eye Gaze', style: context.theme.typography.xs),
                             ),
                             selected: settings.swipeMode == 'eyeTracking',
                             selectedColor: theme.colors.primary,
@@ -115,11 +120,8 @@ class SettingsScreen extends ConsumerWidget {
                         const SizedBox(width: 8),
                         Expanded(
                           child: ChoiceChip(
-                            label: const Center(
-                              child: Text(
-                                'Head Nod',
-                                style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 10),
-                              ),
+                            label: Center(
+                              child: Text('Head Nod', style: context.theme.typography.xs),
                             ),
                             selected: settings.swipeMode == 'headNod',
                             selectedColor: theme.colors.primary,
@@ -135,11 +137,8 @@ class SettingsScreen extends ConsumerWidget {
                         const SizedBox(width: 8),
                         Expanded(
                           child: ChoiceChip(
-                            label: const Center(
-                              child: Text(
-                                'Hand Gesture',
-                                style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 10),
-                              ),
+                            label: Center(
+                              child: Text('Hand Gesture', style: context.theme.typography.xs),
                             ),
                             selected: settings.swipeMode == 'handGesture',
                             selectedColor: theme.colors.primary,
@@ -159,8 +158,8 @@ class SettingsScreen extends ConsumerWidget {
                       settings.swipeMode == 'eyeTracking'
                           ? '👉 Eye Gaze Mode: Look up/down and hold your gaze for the trigger duration to scroll vertically.'
                           : settings.swipeMode == 'headNod'
-                              ? '👉 Head Nodding Mode: Tilt/nod your head up or down to scroll vertically instantly.'
-                              : '👉 Hand Gesture Mode: Swipe your hand in front of the camera to scroll, or use Palm Gestures (Open Palm to Play/Pause, Fist to Stop, Thumbs Up to Select).',
+                          ? '👉 Head Nodding Mode: Tilt/nod your head up or down to scroll vertically instantly.'
+                          : '👉 Hand Gesture Mode: Swipe your hand in front of the camera to scroll, or use Palm Gestures (Open Palm to Play/Pause, Fist to Stop, Thumbs Up to Select).',
                       style: theme.typography.xs.copyWith(
                         color: theme.colors.primary,
                         fontStyle: FontStyle.italic,
@@ -173,13 +172,14 @@ class SettingsScreen extends ConsumerWidget {
               _buildSettingCard(
                 context,
                 title: 'Trigger Hold Duration: ${settings.triggerDurationMs}ms',
-                subtitle: 'Eye attention must continuously look downward for this duration before vertical swipes fire.',
+                subtitle:
+                    'Eye attention must continuously look downward for this duration before vertical swipes fire.',
                 child: Row(
                   mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                   children: [500, 800, 1200].map((ms) {
                     final isSelected = settings.triggerDurationMs == ms;
                     return ChoiceChip(
-                      label: Text('$ms ms', style: const TextStyle(color: Colors.white)),
+                      label: Text('$ms ms', style: context.theme.typography.xs),
                       selected: isSelected,
                       selectedColor: theme.colors.primary,
                       backgroundColor: theme.colors.card,
@@ -192,7 +192,8 @@ class SettingsScreen extends ConsumerWidget {
               _buildSettingCard(
                 context,
                 title: 'Pause on Look Away',
-                subtitle: 'Automatically pause media playback when you look away from the screen, and resume when you look back.',
+                subtitle:
+                    'Automatically pause media playback when you look away from the screen, and resume when you look back.',
                 child: Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
@@ -200,7 +201,9 @@ class SettingsScreen extends ConsumerWidget {
                       settings.pauseOnLookAway ? 'Enabled' : 'Disabled',
                       style: theme.typography.sm.copyWith(
                         fontWeight: FontWeight.bold,
-                        color: settings.pauseOnLookAway ? const Color(0xFF22C55E) : theme.colors.mutedForeground,
+                        color: settings.pauseOnLookAway
+                            ? const Color(0xFF22C55E)
+                            : theme.colors.mutedForeground,
                       ),
                     ),
                     FSwitch(
@@ -214,7 +217,8 @@ class SettingsScreen extends ConsumerWidget {
               _buildSettingCard(
                 context,
                 title: 'System-Wide Mode',
-                subtitle: 'When enabled, gaze scrolling works on all apps. When disabled, gestures are restricted to whitelisted apps below.',
+                subtitle:
+                    'When enabled, gaze scrolling works on all apps. When disabled, gestures are restricted to whitelisted apps below.',
                 child: Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
@@ -222,7 +226,9 @@ class SettingsScreen extends ConsumerWidget {
                       settings.systemWide ? 'System-Wide' : 'Whitelisted Only',
                       style: theme.typography.sm.copyWith(
                         fontWeight: FontWeight.bold,
-                        color: settings.systemWide ? const Color(0xFF22C55E) : theme.colors.mutedForeground,
+                        color: settings.systemWide
+                            ? const Color(0xFF22C55E)
+                            : theme.colors.mutedForeground,
                       ),
                     ),
                     FSwitch(
@@ -317,12 +323,7 @@ class SettingsScreen extends ConsumerWidget {
             ),
           ),
           const SizedBox(height: 6),
-          Text(
-            subtitle,
-            style: theme.typography.xs.copyWith(
-              color: theme.colors.mutedForeground,
-            ),
-          ),
+          Text(subtitle, style: theme.typography.xs.copyWith(color: theme.colors.mutedForeground)),
           const SizedBox(height: 16),
           child,
         ],
@@ -348,7 +349,10 @@ class SettingsScreen extends ConsumerWidget {
             children: [
               Text(
                 appName,
-                style: theme.typography.sm.copyWith(fontWeight: FontWeight.w600, color: theme.colors.foreground),
+                style: theme.typography.sm.copyWith(
+                  fontWeight: FontWeight.w600,
+                  color: theme.colors.foreground,
+                ),
               ),
               const SizedBox(height: 2),
               Text(
@@ -357,10 +361,7 @@ class SettingsScreen extends ConsumerWidget {
               ),
             ],
           ),
-          FSwitch(
-            value: enabled,
-            onChange: (_) => onChanged(),
-          ),
+          FSwitch(value: enabled, onChange: (_) => onChanged()),
         ],
       ),
     );

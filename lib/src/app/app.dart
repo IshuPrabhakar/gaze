@@ -1,3 +1,4 @@
+import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:forui/forui.dart';
@@ -11,13 +12,23 @@ class App extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final router = ref.watch(goRouterProvider);
-
+    final baseTheme = AppTheme.dark();
+    final themeData = baseTheme.copyWith(
+      colors: baseTheme.colors.copyWith(primary: const Color(0xFF39A7FF)),
+    );
     return MaterialApp.router(
       title: 'Gaze',
       debugShowCheckedModeBanner: false,
-      routerConfig: router,
+      routeInformationParser: router.routeInformationParser,
+      routeInformationProvider: router.routeInformationProvider,
+      routerDelegate: router.routerDelegate,
+      theme: themeData.toApproximateMaterialTheme().copyWith(
+        pageTransitionsTheme: const PageTransitionsTheme(
+          builders: {TargetPlatform.android: CupertinoPageTransitionsBuilder()},
+        ),
+      ),
       builder: (context, child) {
-        return FTheme(data: AppTheme.dark(), child: child ?? const SizedBox.shrink());
+        return FTheme(data: themeData, child: child ?? const SizedBox.shrink());
       },
     );
   }

@@ -1,8 +1,9 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:forui/forui.dart';
 import 'package:gaze/src/features/permissions/ui/permissions_screen.dart';
 import 'package:go_router/go_router.dart';
-import 'package:flutter_riverpod/flutter_riverpod.dart';
+
 import '../../../core/services/shared_preferences_provider.dart';
 
 class OnboardingScreen extends ConsumerWidget {
@@ -23,32 +24,7 @@ class OnboardingScreen extends ConsumerWidget {
             children: [
               const Spacer(),
               // Icon/Illustration placeholder or actual beautiful gradient shape
-              Center(
-                child: Container(
-                  width: 100,
-                  height: 100,
-                  decoration: BoxDecoration(
-                    shape: BoxShape.circle,
-                    gradient: LinearGradient(
-                      colors: [theme.colors.primary, theme.colors.primary.withValues(alpha: 0.7)],
-                      begin: Alignment.topLeft,
-                      end: Alignment.bottomRight,
-                    ),
-                    boxShadow: [
-                      BoxShadow(
-                        color: theme.colors.primary.withValues(alpha: 0.4),
-                        blurRadius: 30,
-                        spreadRadius: 5,
-                      ),
-                    ],
-                  ),
-                  child: Icon(
-                    Icons.remove_red_eye_rounded,
-                    size: 48,
-                    color: theme.colors.primaryForeground,
-                  ),
-                ),
-              ),
+              Center(child: Image.asset('assets/images/app_icon.png', width: 150, height: 150)),
               const SizedBox(height: 40),
               // Premium typography
               Text(
@@ -57,6 +33,7 @@ class OnboardingScreen extends ConsumerWidget {
                 style: theme.typography.xl3.copyWith(
                   fontWeight: FontWeight.bold,
                   color: theme.colors.foreground,
+                  height: 1.2,
                 ),
               ),
               const SizedBox(height: 12),

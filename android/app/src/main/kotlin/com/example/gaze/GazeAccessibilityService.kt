@@ -341,8 +341,9 @@ class GazeAccessibilityService : AccessibilityService() {
             val w = dm.widthPixels.toFloat()
             val h = dm.heightPixels.toFloat()
 
-            // Non-linear calculation of distance fractions based on configurations
-            val fraction = (profile.config.swipeDistanceFraction * (0.8f + (intensity * 0.4f))).coerceIn(0.15f, 0.95f)
+            // Non-linear calculation of distance fractions based on configurations, scaled down to remain near the center of the screen and avoid system edge/navigation gestures
+            val rawFraction = (profile.config.swipeDistanceFraction * (0.8f + (intensity * 0.4f))).coerceIn(0.15f, 0.95f)
+            val fraction = rawFraction * 0.45f
 
             val path = Path()
             when (direction) {
