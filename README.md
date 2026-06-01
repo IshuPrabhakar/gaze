@@ -77,14 +77,23 @@ graph TD
 ```
 
 ### 1. The Native Gaze Engine (Kotlin)
-*   **`GazeForegroundService.kt`**: The processing heartbeat. Runs as a sticky Android Foreground Service, capturing front-facing camera frames through `Camera2 API` at throttled rates (33ms active, 200ms idle) and piping them directly to **MediaPipe FaceLandmarker**.
-*   **3D Camera-Space Un-Projection**: Landmark vectors are converted to millimeter-metric space using average physical Inter-Pupillary Distance (IOD) offsets to decouple depth variations.
-*   **Gravity & Motion Decoupling**: Utilizes `TYPE_ROTATION_VECTOR` and `TYPE_GYROSCOPE` sensor inputs to continuously rotate 3D gaze vectors relative to the device's absolute roll/pitch space, preventing posture anomalies (like lying down) from corrupting the baseline.
-*   **One Euro Filter Smoothing**: Telemetry is smoothed using high-velocity One Euro Filters to suppress jitter while maintaining ultra-low latency responsiveness.
-*   **Nod State Machine**: Employs a robust three-phase transition model (`IDLE` -> `ARMED` -> `FIRED` -> `IDLE`) checking for peak-and-return criteria within a `600ms` window to prevent false gestures from minor hand tremors.
+*   **`GazeForegroundService.kt`**: The system heartbeat. Runs as a sticky Android Foreground Service, capturing camera frames through the `Camera2 API` at throttled rates. It coordinates the high-performance gaze tracking pipeline.
+*   **MediaPipe ROI Isolation**: MediaPipe is utilized *strictly* for face landmarker mesh extraction and eye Region of Interest (ROI) location.
+*   **L2CS-Net ONNX Inference**: A deeply integrated L2CS-Net model predicts high-resolution pitch and yaw angles from raw eye crops. Native inference runs reflectively via `OnnxReflectiveRunner` with full hardware-accelerated **NNAPI support** and a graceful mathematical fallback.
+*   **Active Calibration Integration**: Dynamically loads, maps, and normalizes raw gaze coordinates `[-1.0, 1.0]` based on the user's guided 9-stage calibration profile (neutral vectors, top/bottom/left/right thresholds, deadzones, and vertical/horizontal biases).
+*   **CropStabilizer**: Employs temporal Exponential Moving Average (EMA) and affine eye bounding box alignment to deliver consistent eye crops across frames.
+*   **ConfidenceEngine**: Combines landmark visibility, eyelid closure blendshapes, and device gyro motion to compute a real-time tracking confidence score (0.0 to 1.0) and suppress erratic vectors.
+*   **GazeStateMachine**: Implements a robust state-driven navigation model with states like `NO_FACE`, `SEARCHING`, `TRACKING`, `UNSTABLE`, `STABLE_LOCK`, `ACTION_READY`, and `COOLDOWN`.
+*   **BlinkDetector**: Computes Eye Aspect Ratio (EAR) combined with blendshape inputs to freeze cursor coordinates during involuntary blinks.
+*   **DirectionHysteresis**: Establishes directional entry/exit thresholds to fully eliminate boundary flickering near horizontal, vertical, and diagonal state transitions.
+*   **AccessibilitySafetyEngine**: Enforces safety cooldowns, action gating, gesture rate limits, and adaptive velocity-aware One Euro + EMA filtering.
+*   **DriftCorrectionManager**: Automatically dampens long-session posture and calibration drift.
+*   **InteractionProfileManager**: Tunes scroll dwell thresholds and gesture speed parameters based on the active foreground application class (e.g. YouTube flick scroll vs. Chrome precision scroll).
+*   **ThermalPerformanceManager**: Adjusts active camera frame skipping and throttling modes dynamically based on confidence and state changes to optimize battery life and avoid thermal throttling.
 
 ### 2. The Application Shell (Flutter)
-*   **State Propagation**: Multi-threaded updates are captured via platform channels and exposed through declarative `NotifierProviders`.
+*   **State Propagation**: Multi-threaded updates (including real-time `rawConfidence` and `internalState` diagnostics) are streamed via platform method channels and exposed in declarative `NotifierProviders`.
+*   **Guided Calibration Interface**: Interactive onboarding flow guides the user through establishing custom neutral anchors and coordinate offsets.
 *   **Accessibility Integration**: Accessibility swipes are dispatched dynamically via node coordinates using targeted, device-scaled stroke generators.
 
 ---

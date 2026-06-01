@@ -13,6 +13,8 @@ import android.view.KeyEvent
 import android.graphics.Bitmap
 import android.graphics.Path
 import android.graphics.ImageFormat
+import android.graphics.RectF
+import android.graphics.Matrix
 import android.accessibilityservice.GestureDescription
 import android.hardware.camera2.*
 import android.hardware.camera2.params.OutputConfiguration
@@ -26,21 +28,22 @@ import com.google.mediapipe.tasks.vision.facelandmarker.FaceLandmarkerResult
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarker
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarkerResult
 import com.google.mediapipe.framework.image.BitmapImageBuilder
+import com.google.mediapipe.framework.image.BitmapExtractor
 import com.google.mediapipe.tasks.vision.core.ImageProcessingOptions
+import com.google.mediapipe.tasks.components.containers.NormalizedLandmark
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import java.io.File
 import java.io.FileOutputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.nio.FloatBuffer
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
 class GazeForegroundService : Service() {
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Companion / static state
-    // ─────────────────────────────────────────────────────────────────────────
 
     companion object {
         private const val TAG = "GazeForegroundService"
@@ -51,7 +54,6 @@ class GazeForegroundService : Service() {
         var isServiceRunning = false
             private set
 
-        // Settings configured from Flutter (Thread-visible)
         @Volatile
         var sensitivity: Float = 0.5f
         @Volatile
@@ -67,7 +69,6 @@ class GazeForegroundService : Service() {
         @Volatile
         var swipeMode: String = "eyeTracking"
 
-        // Sensor values for telemetry/fusion (Thread-visible)
         @Volatile
         var devicePitchDeg: Float = 0f
         @Volatile
@@ -75,14 +76,9 @@ class GazeForegroundService : Service() {
         @Volatile
         var deviceYawDeg: Float = 0f
 
-        // Listeners for gaze telemetry (sent to Flutter overlay/dashboard)
         @Volatile
         var telemetryListener: ((GazeState) -> Unit)? = null
     }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Data classes
-    // ─────────────────────────────────────────────────────────────────────────
 
     data class GazeState(
         val isFaceDetected: Boolean,
@@ -101,118 +97,83 @@ class GazeForegroundService : Service() {
         val isSwipeLeft: Boolean = false,
         val isSwipeRight: Boolean = false,
         val isSwipeUp: Boolean = false,
-        val isSwipeDown: Boolean = false
+        val isSwipeDown: Boolean = false,
+        val rawConfidence: Float = 1.0f,
+        val internalState: String = "TRACKING"
     )
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Head-nod state machine
-    // ─────────────────────────────────────────────────────────────────────────
+    enum class GazeStateEnum { NO_FACE, SEARCHING, TRACKING, UNSTABLE, STABLE_LOCK, ACTION_READY, COOLDOWN }
 
-    /**
-     * Three-phase nod detector that requires:
-     *   IDLE  → deviation exceeds threshold       → ARMED
-     *   ARMED → deviation returns to near-neutral → FIRED  (nod confirmed)
-     *   FIRED → deviation fully back at neutral   → IDLE   (ready for next nod)
-     *
-     * This eliminates false-positives from hand tremors or slow postural drift
-     * because a genuine nod peaks and returns within [nodMaxDurationMs].
-     */
-    private enum class NodPhase { IDLE, ARMED, FIRED }
+    // Outer data classes to resolve inner-class nested declaration restrictions in Kotlin
+    data class BlinkResult(val isBlinking: Boolean, val blinkScore: Float, val eyeOpenness: Float)
+    data class HysteresisResult(val isLookingDown: Boolean, val isLookingUp: Boolean)
+    data class AppGestureConfig(val swipeDistanceFraction: Float, val minIntervalMs: Long)
+    data class AppInteractionProfile(val config: AppGestureConfig, val stabilityDurationMs: Long)
 
-    // Yaw (left / right) nod state
+    // Instance fields for state processing
+    private var scrollCooldownMs     = 1500L
+    private var adaptiveFrameThrottleMs = 33L
+    private var lastScrollTime       = 0L
+
+    private var topThreshold: Float = 0.60f
+    private var bottomThreshold: Float = -0.60f
+    private var leftThreshold: Float = -0.60f
+    private var rightThreshold: Float = 0.60f
+    private var verticalBias: Float = 0.0f
+    private var horizontalBias: Float = 0.0f
+    private var deadzoneRadius: Float = 0.08f
+
+
+    // Modular components instances
+    private lateinit var cropStabilizer: CropStabilizer
+    private lateinit var confidenceEngine: ConfidenceEngine
+    private lateinit var gazeStateMachine: GazeStateMachine
+    private lateinit var blinkDetector: BlinkDetector
+    private lateinit var directionHysteresis: DirectionHysteresis
+    private lateinit var safetyEngine: AccessibilitySafetyEngine
+    private lateinit var thermalManager: ThermalPerformanceManager
+    private lateinit var driftManager: DriftCorrectionManager
+    private lateinit var profileManager: InteractionProfileManager
+
     private var yawNodPhase     = NodPhase.IDLE
-    private var yawNodDirection = 0          // +1 = nod-left peak, -1 = nod-right peak
+    private var yawNodDirection = 0
     private var yawNodPeak      = 0f
     private var yawNodStartTime = 0L
 
-    // Pitch (up / down) nod state
     private var pitchNodPhase     = NodPhase.IDLE
-    private var pitchNodDirection = 0        // +1 = nod-down peak, -1 = nod-up peak
+    private var pitchNodDirection = 0
     private var pitchNodPeak      = 0f
     private var pitchNodStartTime = 0L
 
-    // A nod must complete (peak → return) within this window; otherwise it is
-    // treated as a sustained posture change and ignored.
     private val nodMaxDurationMs  = 600L
-
-    // After firing, the deviation must fall below this fraction of the peak
-    // before the state machine re-arms.  Prevents double-firing on one nod.
     private val nodReturnFraction = 0.4f
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Baseline / posture fields
-    // ─────────────────────────────────────────────────────────────────────────
-
     private var yawBaseline   = 0f
-    private var pitchBaseline = 0f   // intentionally 0; warm-up will set the real value
+    private var pitchBaseline = 0f
     private var baselineInitialized   = false
     private var baselineSampleCount   = 0
-    private val baselineWarmupFrames  = 15   // average first N frames for a clean start
+    private val baselineWarmupFrames  = 15
+    private val baselineDriftRate = 0.995f
 
-    // Post-warmup: very slow exponential drift so gradual posture changes
-    // (e.g. slouching, tilting phone) are absorbed without swallowing
-    // short intentional gestures (~300–800 ms).
-    private val baselineDriftRate = 0.995f   // was 0.99 — slower = gestures not absorbed
+    private var reflectiveRunner: OnnxReflectiveRunner? = null
+    private val inputSize = 96 
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Gaze blendshape smoothing
-    // ─────────────────────────────────────────────────────────────────────────
+    private var calibrationMatrix = floatArrayOf(
+        1f, 0f, 0f, 
+        0f, 1f, 0f  
+    )
 
-    // Exponential moving average applied to raw blendshape scores.
-    // Suppresses single-frame spikes that reset the hold-duration timer prematurely.
-    private var smoothedGazeDown = 0f
-    private var smoothedGazeUp   = 0f
-
-    // α = 0 → no smoothing (instant); α = 1 → infinite lag.
-    // 0.4 keeps single-frame noise damped while preserving ~200 ms responsiveness.
-    private val gazeSmoothing = 0.4f
-
-    // Blendshape baselines — the resting "neutral gaze" score for this person/device.
-    // MediaPipe's eyeLookDownLeft/Right routinely sit at 0.4–0.6 at rest on many
-    // devices.  Without subtracting this offset every threshold comparison fires
-    // permanently.  These are seeded during the same warm-up window as the head-pose
-    // baseline, then drift very slowly afterward (same 0.995 rate).
-    private var gazeDownBaseline  = 0f
-    private var gazeUpBaseline    = 0f
-    private var gazeBaselineReady = false   // true after warm-up accumulates enough frames
-
-    // Running sum accumulators for the warm-up average (separate from head-pose counter
-    // so they stay in sync).
-    private var gazeDownAccum = 0f
-    private var gazeUpAccum   = 0f
-
-    // Customized calibration thresholds loaded from SharedPreferences
-    private var customTopThreshold: Float = 0f
-    private var customBottomThreshold: Float = 0f
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Scroll timing
-    // ─────────────────────────────────────────────────────────────────────────
+    private var smoothedYaw = 0f
+    private var smoothedPitch = 0f
 
     private var lookingDownStartTime = 0L
     private var lookingUpStartTime   = 0L
-    private var lastScrollTime       = 0L
-    private val scrollCooldownMs     = 1500L  // prevents gesture spamming
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Media / look-away state
-    // ─────────────────────────────────────────────────────────────────────────
-
-    private var wasAttentiveLastState = true
-    private var lastDevicePitch = 0f
-    private var lastDeviceRoll = 0f
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Hand tracking & gesture classification fields
-    // ─────────────────────────────────────────────────────────────────────────
     private var handLandmarker: HandLandmarker? = null
-
-    // Swipe tracking
     private val swipeHistory = java.util.ArrayList<Pair<Long, android.graphics.PointF>>()
     private val swipeCooldownMs = 1200L
     private var lastSwipeTriggeredTime = 0L
 
-    // Palm gesture stability tracking
     private var lastStabilityGesture = "NONE"
     private var gestureStabilityStartTime = 0L
     private val stabilityDurationMs = 400L
@@ -220,22 +181,16 @@ class GazeForegroundService : Service() {
     private var lastPalmGestureTriggerTime = 0L
     private val palmGestureCooldownMs = 1500L
 
-    // Face attention temporal fields
     private var isUserAttentive = true
     private var attentionStateTransitionTime = 0L
     private val attentionLostThresholdMs = 1500L
     private val attentionRegainThresholdMs = 500L
 
-    // State cache to combine asynchronously updated face & hand detections
     private var currentHandGesture = "NONE"
     private var flagSwipeLeft = false
     private var flagSwipeRight = false
     private var flagSwipeUp = false
     private var flagSwipeDown = false
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Camera / MediaPipe infrastructure & Sensor Fusion / Filtering
-    // ─────────────────────────────────────────────────────────────────────────
 
     private lateinit var backgroundExecutor: ExecutorService
     private var faceLandmarker: FaceLandmarker? = null
@@ -247,15 +202,11 @@ class GazeForegroundService : Service() {
     private var cameraHandler: Handler? = null
 
     private var lastProcessedFrameTime = 0L
-    @Volatile
-    private var adaptiveFrameThrottleMs = 33L   // Dynamic: 33ms (30 FPS) active / 200ms (5 FPS) idle
-    private var cachedPixels: IntArray? = null   // Pre-allocated reusable buffer to avoid GC pressure
-
+    private var cachedPixels: IntArray? = null
     private var frameCount       = 0
     private var faceCount        = 0
     private var sensorOrientation = 270
 
-    // Sensor Fusion & One Euro Filters
     private var sensorManager: SensorManager? = null
     private var rotationVectorSensor: Sensor? = null
     private var gyroSensor: Sensor? = null
@@ -265,6 +216,8 @@ class GazeForegroundService : Service() {
     private var filterGazeUp: OneEuroFilter? = null
     private var filterHeadYaw: OneEuroFilter? = null
     private var filterHeadPitch: OneEuroFilter? = null
+
+    private enum class NodPhase { IDLE, ARMED, FIRED }
 
     class OneEuroFilter(
         val minCutoff: Double,
@@ -335,28 +288,34 @@ class GazeForegroundService : Service() {
         override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Service lifecycle
-    // ─────────────────────────────────────────────────────────────────────────
-
     override fun onCreate() {
         super.onCreate()
         Log.d(TAG, "GazeForegroundService created")
         backgroundExecutor = Executors.newSingleThreadExecutor()
         
-        // Setup One Euro Filters
+        // Initialize modular components
+        cropStabilizer = CropStabilizer()
+        confidenceEngine = ConfidenceEngine()
+        gazeStateMachine = GazeStateMachine()
+        blinkDetector = BlinkDetector()
+        directionHysteresis = DirectionHysteresis()
+        safetyEngine = AccessibilitySafetyEngine()
+        thermalManager = ThermalPerformanceManager()
+        driftManager = DriftCorrectionManager()
+        profileManager = InteractionProfileManager()
+
         filterGazeDown = OneEuroFilter(1.0, 0.01, 1.0)
         filterGazeUp = OneEuroFilter(1.0, 0.01, 1.0)
         filterHeadYaw = OneEuroFilter(1.2, 0.015, 1.0)
         filterHeadPitch = OneEuroFilter(1.2, 0.015, 1.0)
 
-        // Setup Sensor Fusion
         sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
         rotationVectorSensor = sensorManager?.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
         gyroSensor = sensorManager?.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
 
         createNotificationChannel()
         initMediaPipe()
+        initOnnx()
         startBackgroundThread()
     }
 
@@ -367,7 +326,6 @@ class GazeForegroundService : Service() {
 
         if (cameraThread == null) startBackgroundThread()
 
-        // Register sensors
         rotationVectorSensor?.let {
             sensorManager?.registerListener(sensorListener, it, SensorManager.SENSOR_DELAY_UI)
         }
@@ -377,7 +335,7 @@ class GazeForegroundService : Service() {
 
         val notification = createNotification(
             "Gaze Service Active",
-            "Hands-free control is running in the background."
+            "Hands-free control is running in the background with L2CS-Net."
         )
         startForeground(NOTIFICATION_ID, notification)
         startCameraProcessing()
@@ -398,12 +356,9 @@ class GazeForegroundService : Service() {
         backgroundExecutor.shutdown()
         faceLandmarker?.close()
         handLandmarker?.close()
+        reflectiveRunner?.close()
         simulatorHandler?.removeCallbacksAndMessages(null)
     }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Notification helpers
-    // ─────────────────────────────────────────────────────────────────────────
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -412,7 +367,7 @@ class GazeForegroundService : Service() {
                 "Gaze Background Tracker",
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
-                description = "Shows when eye-gaze tracking is running."
+                description = "Shows when L2CS-Net eye-gaze tracking is running."
             }
             (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
                 .createNotificationChannel(channel)
@@ -439,14 +394,9 @@ class GazeForegroundService : Service() {
             .notify(NOTIFICATION_ID, createNotification(title, content))
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // MediaPipe initialisation
-    // ─────────────────────────────────────────────────────────────────────────
-
     private fun initMediaPipe() {
         backgroundExecutor.execute {
             try {
-                // Face model setup
                 val modelFile = File(filesDir, "face_landmarker.task")
                 if (!modelFile.exists()) {
                     assets.open("face_landmarker.task").use { input ->
@@ -462,16 +412,18 @@ class GazeForegroundService : Service() {
                     .setBaseOptions(baseOptions)
                     .setRunningMode(RunningMode.LIVE_STREAM)
                     .setOutputFaceBlendshapes(true)
-                    .setResultListener { result, _ -> processFaceLandmarks(result) }
+                    .setResultListener { result, mpImage ->
+                        val inputBitmap = BitmapExtractor.extract(mpImage)
+                        processFaceLandmarksWithBitmap(result, inputBitmap)
+                    }
                     .setErrorListener { error ->
                         Log.e(TAG, "MediaPipe error: ${error.message}")
                     }
                     .build()
 
                 faceLandmarker = FaceLandmarker.createFromOptions(this, options)
-                Log.d(TAG, "MediaPipe FaceLandmarker initialised with blendshapes.")
+                Log.d(TAG, "MediaPipe FaceLandmarker initialized.")
 
-                // Hand model setup
                 val handModelFile = File(filesDir, "hand_landmarker.task")
                 if (!handModelFile.exists()) {
                     assets.open("hand_landmarker.task").use { input ->
@@ -493,39 +445,48 @@ class GazeForegroundService : Service() {
                     .build()
 
                 handLandmarker = HandLandmarker.createFromOptions(this, handOptions)
-                Log.d(TAG, "MediaPipe HandLandmarker initialised.")
+                Log.d(TAG, "MediaPipe HandLandmarker initialized.")
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to initialise MediaPipe: ${e.message}. Starting fallback simulator.")
+                Log.e(TAG, "Failed to initialize MediaPipe: ${e.message}. Starting fallback simulator.")
                 startFallbackHeuristicSimulator()
             }
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Core landmark processing  ← all fixes live here
-    // ─────────────────────────────────────────────────────────────────────────
+    private fun initOnnx() {
+        backgroundExecutor.execute {
+            try {
+                val modelFile = File(filesDir, "l2cs.onnx")
+                if (!modelFile.exists()) {
+                    assets.open("l2cs.onnx").use { input ->
+                        FileOutputStream(modelFile).use { output -> input.copyTo(output) }
+                    }
+                }
+                reflectiveRunner = OnnxReflectiveRunner(this, modelFile.absolutePath)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to load ONNX model: ${e.message}. Fallback will execute inside pipeline.")
+            }
+        }
+    }
 
     private fun processFaceLandmarks(result: FaceLandmarkerResult) {
+        // Obsolete signature.
+    }
+
+    private fun processFaceLandmarksWithBitmap(result: FaceLandmarkerResult, frameBitmap: Bitmap) {
         val blendshapesOptional = result.faceBlendshapes()
         val landmarks           = result.faceLandmarks()
 
-        // ── No face detected ──────────────────────────────────────────────────
         if (blendshapesOptional == null
             || !blendshapesOptional.isPresent
             || landmarks.isNullOrEmpty()
-            || landmarks[0].size <= 263   // need indices 1, 10, 33, 152, 263
+            || landmarks[0].size <= 263
         ) {
-            // Reset all smoothing / baseline so the next detection starts fresh
-            smoothedGazeDown      = 0f
-            smoothedGazeUp        = 0f
             baselineInitialized   = false
             baselineSampleCount   = 0
-            gazeBaselineReady     = false
-            gazeDownAccum         = 0f
-            gazeUpAccum           = 0f
             yawNodPhase           = NodPhase.IDLE
             pitchNodPhase         = NodPhase.IDLE
-
+            gazeStateMachine.updateState(GazeStateEnum.NO_FACE)
             publishGazeState(emptyGazeState())
             return
         }
@@ -533,44 +494,22 @@ class GazeForegroundService : Service() {
         faceCount++
         val scores = blendshapesOptional.get()[0].associate { it.categoryName() to it.score() }
         val face   = landmarks[0]
+        val now = System.currentTimeMillis()
 
-        // ── 1. Physical Eye Aspect Ratio (EAR) Blink Detection ────────────────
-        // Left eye contours: 33 (outer), 160 (top-outer), 158 (top-inner), 133 (inner), 153 (bottom-inner), 144 (bottom-outer)
-        val lEAR = if (face.size > 160) {
-            val h1 = Math.sqrt(((face[160].x()-face[144].x()).let { it*it } + (face[160].y()-face[144].y()).let { it*it } + (face[160].z()-face[144].z()).let { it*it }).toDouble()).toFloat()
-            val h2 = Math.sqrt(((face[158].x()-face[153].x()).let { it*it } + (face[158].y()-face[153].y()).let { it*it } + (face[158].z()-face[153].z()).let { it*it }).toDouble()).toFloat()
-            val w  = Math.sqrt(((face[33].x()-face[133].x()).let { it*it } + (face[33].y()-face[133].y()).let { it*it } + (face[33].z()-face[133].z()).let { it*it }).toDouble()).toFloat()
-            (h1 + h2) / (2f * w.coerceAtLeast(0.001f))
-        } else 0.25f
+        // 1. ADVANCED BLINK & WINK DETECTOR
+        val blinkResult = blinkDetector.detectBlink(face, scores)
+        val isBlinking = blinkResult.isBlinking
+        val avgBlinkScore = blinkResult.blinkScore
+        val eyeOpenness = blinkResult.eyeOpenness
 
-        // Right eye contours: 263 (outer), 385 (top-outer), 387 (top-inner), 362 (inner), 373 (bottom-inner), 380 (bottom-outer)
-        val rEAR = if (face.size > 387) {
-            val h1 = Math.sqrt(((face[385].x()-face[380].x()).let { it*it } + (face[385].y()-face[380].y()).let { it*it } + (face[385].z()-face[380].z()).let { it*it }).toDouble()).toFloat()
-            val h2 = Math.sqrt(((face[387].x()-face[373].x()).let { it*it } + (face[387].y()-face[373].y()).let { it*it } + (face[387].z()-face[373].z()).let { it*it }).toDouble()).toFloat()
-            val w  = Math.sqrt(((face[263].x()-face[362].x()).let { it*it } + (face[263].y()-face[362].y()).let { it*it } + (face[263].z()-face[362].z()).let { it*it }).toDouble()).toFloat()
-            (h1 + h2) / (2f * w.coerceAtLeast(0.001f))
-        } else 0.25f
-
-        val avgEAR = (lEAR + rEAR) / 2f
-        val leftBlinkScore  = scores["eyeBlinkLeft"]  ?: 0f
-        val rightBlinkScore = scores["eyeBlinkRight"] ?: 0f
-        val avgBlinkScore   = (leftBlinkScore + rightBlinkScore) / 2f
-        val eyeOpenness     = (1f - avgBlinkScore) * 100f
-        
-        // Dual metric validation: blend shapes + physical EAR to prevent glasses reflections spikes
-        val isBlinking      = (avgBlinkScore * 0.6f + (if (avgEAR < 0.20f) 1.0f else 0.0f) * 0.4f) > 0.60f
-
-        // ── 2. True 3D Camera-Space Un-Projection & Head Rotation Matrix R_h ──
+        // 2. Head Decoupling/Pose Baseline calculations
         val lEyeLm = face[33]
         val rEyeLm = face[263]
         val iodNormDx = rEyeLm.x() - lEyeLm.x()
         val iodNormDy = rEyeLm.y() - lEyeLm.y()
         val iodNorm = Math.sqrt((iodNormDx * iodNormDx + iodNormDy * iodNormDy).toDouble()).toFloat().coerceAtLeast(0.01f)
-        
-        // Estimate physical camera distance using average physical IOD (70mm) and front-camera focal approximation (f=280)
         val zCenter = (280f * 70f) / (iodNorm * 320f)
 
-        // Helper function to unproject normalized MediaPipe coordinates into millimeter metric camera space
         fun get3DPoint(idx: Int): FloatArray {
             val lm = face[idx]
             val zPhysical = zCenter + lm.z() * 70f
@@ -579,12 +518,10 @@ class GazeForegroundService : Service() {
             return floatArrayOf(xPhysical, yPhysical, zPhysical)
         }
 
-        val p33 = get3DPoint(33)     // Left Eye Outer
-        val p263 = get3DPoint(263)   // Right Eye Outer
-        val p10 = get3DPoint(10)     // Forehead
-        val p152 = get3DPoint(152)   // Chin
-        val p133 = get3DPoint(133)   // Left Eye Inner
-        val p362 = get3DPoint(362)   // Right Eye Inner
+        val p33 = get3DPoint(33)
+        val p263 = get3DPoint(263)
+        val p10 = get3DPoint(10)
+        val p152 = get3DPoint(152)
 
         val uxDx = p263[0] - p33[0]
         val uxDy = p263[1] - p33[1]
@@ -598,7 +535,6 @@ class GazeForegroundService : Service() {
         val uyRawLen = Math.sqrt((uyRawDx * uyRawDx + uyRawDy * uyRawDy + uyRawDz * uyRawDz).toDouble()).toFloat().coerceAtLeast(0.001f)
         val uyRaw = floatArrayOf(uyRawDx / uyRawLen, uyRawDy / uyRawLen, uyRawDz / uyRawLen)
 
-        // Orthonormal Z axis via cross product (Z = X cross Y)
         val uz = floatArrayOf(
             ux[1]*uyRaw[2] - ux[2]*uyRaw[1],
             ux[2]*uyRaw[0] - ux[0]*uyRaw[2],
@@ -607,83 +543,21 @@ class GazeForegroundService : Service() {
         val lenZ = Math.sqrt((uz[0]*uz[0] + uz[1]*uz[1] + uz[2]*uz[2]).toDouble()).toFloat().coerceAtLeast(0.001f)
         uz[0] /= lenZ; uz[1] /= lenZ; uz[2] /= lenZ
 
-        // Perfect orthogonal Y axis (Y = Z cross X)
         val uy = floatArrayOf(
             uz[1]*ux[2] - uz[2]*ux[1],
             uz[2]*ux[0] - uz[0]*ux[2],
             uz[0]*ux[1] - uz[1]*ux[0]
         )
 
-        // R_h transpose values for inverse vector rotation (decouples head rotation)
-        val r00 = ux[0]; val r01 = ux[1]; val r02 = ux[2]
-        val r10 = uy[0]; val r11 = uy[1]; val r12 = uy[2]
-        val r20 = uz[0]; val r21 = uz[1]; val r22 = uz[2]
-
-        // ── 3. 3D Eyeball Vector and Canonical Gaze Normalization ────────────
-        val lEyeCenter3D = floatArrayOf((p33[0] + p133[0]) / 2f, (p33[1] + p133[1]) / 2f, (p33[2] + p133[2]) / 2f)
-        val rEyeCenter3D = floatArrayOf((p263[0] + p362[0]) / 2f, (p263[1] + p362[1]) / 2f, (p263[2] + p362[2]) / 2f)
-
-        // Iris centers (468 left, 473 right)
-        val hasIris = face.size > 473
-        val lPupil3D = if (hasIris) get3DPoint(468) else p33
-        val rPupil3D = if (hasIris) get3DPoint(473) else p263
-
-        val lGazeRaw = floatArrayOf(lPupil3D[0] - lEyeCenter3D[0], lPupil3D[1] - lEyeCenter3D[1], lPupil3D[2] - lEyeCenter3D[2])
-        val rGazeRaw = floatArrayOf(rPupil3D[0] - rEyeCenter3D[0], rPupil3D[1] - rEyeCenter3D[1], rPupil3D[2] - rEyeCenter3D[2])
-
-        // Rotate 3D gaze vector into canonical eyeball head space via R_h^T
-        val lGazeCanonical = floatArrayOf(
-            r00 * lGazeRaw[0] + r01 * lGazeRaw[1] + r02 * lGazeRaw[2],
-            r10 * lGazeRaw[0] + r11 * lGazeRaw[1] + r12 * lGazeRaw[2],
-            r20 * lGazeRaw[0] + r21 * lGazeRaw[1] + r22 * lGazeRaw[2]
-        )
-        val rGazeCanonical = floatArrayOf(
-            r00 * rGazeRaw[0] + r01 * rGazeRaw[1] + r02 * rGazeRaw[2],
-            r10 * rGazeRaw[0] + r11 * rGazeRaw[1] + r12 * rGazeRaw[2],
-            r20 * rGazeRaw[0] + r21 * rGazeRaw[1] + r22 * rGazeRaw[2]
-        )
-
-        // Project nose-tip to measure head yaw/pitch in physical millimeters
-        val p1 = get3DPoint(1) // Nose Tip
+        val p1 = get3DPoint(1)
         val eyeMid = floatArrayOf((p33[0] + p263[0]) / 2f, (p33[1] + p263[1]) / 2f, (p33[2] + p263[2]) / 2f)
         val dNoseX = p1[0] - eyeMid[0]
         val dNoseY = p1[1] - eyeMid[1]
         val dNoseZ = p1[2] - eyeMid[2]
 
         val iodMetric = Math.sqrt(((p263[0]-p33[0])*(p263[0]-p33[0]) + (p263[1]-p33[1])*(p263[1]-p33[1]) + (p263[2]-p33[2])*(p263[2]-p33[2])).toDouble()).toFloat().coerceAtLeast(1f)
-        
         val headYaw   = (dNoseX * ux[0] + dNoseY * ux[1] + dNoseZ * ux[2]) / iodMetric
         val headPitch = (dNoseX * uy[0] + dNoseY * uy[1] + dNoseZ * uy[2]) / iodMetric
-
-        // ── 4. Device Sensor Fusion & Gravity Roll Compensation ──────────────
-        val pitchShift = Math.abs(devicePitchDeg - lastDevicePitch)
-        val rollShift = Math.abs(deviceRollDeg - lastDeviceRoll)
-        if (pitchShift > 12f || rollShift > 12f) {
-            baselineInitialized = false
-            baselineSampleCount = 0
-            gazeBaselineReady = false
-            gazeDownAccum = 0f
-            gazeUpAccum = 0f
-            Log.i(TAG, "Sensor Fusion: Dynamic baseline recalibration triggered by posture shift (pitchShift=$pitchShift, rollShift=$rollShift)")
-        }
-        lastDevicePitch = devicePitchDeg
-        lastDeviceRoll = deviceRollDeg
-
-        // Rotate canonical gaze vector around Z-axis by device roll to counteract phone tilt/lying down
-        val rollRad = Math.toRadians(deviceRollDeg.toDouble()).toFloat()
-        val cosR = Math.cos(rollRad.toDouble()).toFloat()
-        val sinR = Math.sin(rollRad.toDouble()).toFloat()
-
-        val lGazeFused = floatArrayOf(
-            lGazeCanonical[0] * cosR - lGazeCanonical[1] * sinR,
-            lGazeCanonical[0] * sinR + lGazeCanonical[1] * cosR,
-            lGazeCanonical[2]
-        )
-        val rGazeFused = floatArrayOf(
-            rGazeCanonical[0] * cosR - rGazeCanonical[1] * sinR,
-            rGazeCanonical[0] * sinR + rGazeCanonical[1] * cosR,
-            rGazeCanonical[2]
-        )
 
         if (!baselineInitialized) {
             val n = baselineSampleCount.toFloat()
@@ -693,21 +567,13 @@ class GazeForegroundService : Service() {
 
             if (baselineSampleCount >= baselineWarmupFrames) {
                 baselineInitialized = true
-                Log.i(TAG, "Baseline ready after $baselineWarmupFrames frames — " +
-                           "Yaw: ${"%.4f".format(yawBaseline)}, " +
-                           "Pitch: ${"%.4f".format(pitchBaseline)}")
             }
 
-            publishGazeState(
-                GazeState(
-                    isFaceDetected = true, isAttentive = false,
-                    isLookingDown = false, isLookingUp = false,
-                    isBlinking = isBlinking, yaw = 0f, pitch = 0f,
-                    eyeOpenness = eyeOpenness
-                )
-            )
+            gazeStateMachine.updateState(GazeStateEnum.SEARCHING)
+            publishGazeState(emptyGazeState().copy(internalState = "SEARCHING"))
             return
         } else {
+            driftManager.applyDriftCorrection(headYaw, headPitch)
             yawBaseline   = yawBaseline   * baselineDriftRate + headYaw   * (1f - baselineDriftRate)
             pitchBaseline = pitchBaseline * baselineDriftRate + headPitch * (1f - baselineDriftRate)
         }
@@ -715,114 +581,85 @@ class GazeForegroundService : Service() {
         val yawDev   = headYaw   - yawBaseline
         val pitchDev = headPitch - pitchBaseline
 
-        // ── 5. Motion-Aware Confidence Scoring ────────────────────────────────
-        val motionPenalty = (gyroMagnitude * 0.08f).coerceAtMost(0.4f)
-        val poseAnglePenalty = (Math.abs(headYaw) * 0.4f + Math.abs(headPitch) * 0.4f).coerceAtMost(0.3f)
-        val gazeConfidence = (1.0f - motionPenalty - poseAnglePenalty).coerceIn(0f, 1f)
+        val confidence = confidenceEngine.calculateConfidence(face, isBlinking, gyroMagnitude, headYaw, headPitch)
 
-        // ── 6. Attention gate ────────────────────────────────────────────────
-        val isAttentive = Math.abs(yawDev) < 0.20f && Math.abs(pitchDev) < 0.15f && gazeConfidence > 0.60f
+        adaptiveFrameThrottleMs = thermalManager.getThrottleMs(confidence, gazeStateMachine.currentState)
 
-        // Dynamically adjust Camera FPS throttling (30 FPS when active, 5 FPS when idle/face lost)
-        adaptiveFrameThrottleMs = if (isAttentive) 33L else 200L
+        var rawPitch = 0f
+        var rawYaw = 0f
 
-        // ── 7. Canonical Gaze Extraction & One Euro Filtering ────────────────
-        // Calculate physical eye width to normalize metric displacement into a scale-invariant ratio
-        val lEyeWidth = Math.sqrt(((p33[0]-p133[0])*(p33[0]-p133[0]) + (p33[1]-p133[1])*(p33[1]-p133[1]) + (p33[2]-p133[2])*(p33[2]-p133[2])).toDouble()).toFloat().coerceAtLeast(1f)
-        val rEyeWidth = Math.sqrt(((p263[0]-p362[0])*(p263[0]-p362[0]) + (p263[1]-p362[1])*(p263[1]-p362[1]) + (p263[2]-p362[2])*(p263[2]-p362[2])).toDouble()).toFloat().coerceAtLeast(1f)
-        val avgEyeWidth = (lEyeWidth + rEyeWidth) / 2f
+        if (confidence > 0.40f && !isBlinking) {
+            val leftEyeRect = cropStabilizer.getStabilizedEyeBoundingBox(face, true, frameBitmap.width, frameBitmap.height)
+            val rightEyeRect = cropStabilizer.getStabilizedEyeBoundingBox(face, false, frameBitmap.width, frameBitmap.height)
 
-        val canonicalEyeY = ((lGazeFused[1] + rGazeFused[1]) / 2f) / avgEyeWidth * 1.8f
-        
-        // Relativize against dynamic gaze baseline offsets
-        val rawGazeDown = (-canonicalEyeY).coerceAtLeast(0f)
-        val rawGazeUp   = canonicalEyeY.coerceAtLeast(0f)
+            val leftCrop = cropBitmapSafe(frameBitmap, leftEyeRect)
+            val rightCrop = cropBitmapSafe(frameBitmap, rightEyeRect)
 
-         if (!gazeBaselineReady) {
-            gazeDownAccum += rawGazeDown
-            gazeUpAccum   += rawGazeUp
-            if (baselineInitialized) {
-                gazeDownBaseline  = gazeDownAccum / baselineWarmupFrames.toFloat()
-                gazeUpBaseline    = gazeUpAccum   / baselineWarmupFrames.toFloat()
-                gazeBaselineReady = true
-                
-                // Instantly reset smoothed state and One Euro filters to avoid warmup decay lag
-                smoothedGazeDown  = 0f
-                smoothedGazeUp    = 0f
-                filterGazeDown    = OneEuroFilter(1.0, 0.01, 1.0)
-                filterGazeUp      = OneEuroFilter(1.0, 0.01, 1.0)
-                
-                Log.i(TAG, "Gaze baseline ready — Down: ${"%.3f".format(gazeDownBaseline)} Up: ${"%.3f".format(gazeUpBaseline)}")
+            if (leftCrop != null && rightCrop != null) {
+                val resizedLeft = Bitmap.createScaledBitmap(leftCrop, inputSize, inputSize, true)
+                val resizedRight = Bitmap.createScaledBitmap(rightCrop, inputSize, inputSize, true)
+
+                val output = runL2CSNetInference(resizedLeft, resizedRight)
+                rawPitch = output.first
+                rawYaw = output.second
+            } else {
+                // Heuristic fallback: Add baselines to align with subtraction below
+                rawYaw = yawDev * 0.7f + yawBaseline
+                rawPitch = pitchDev * 0.7f + pitchBaseline
             }
         } else {
-            gazeDownBaseline = gazeDownBaseline * baselineDriftRate + rawGazeDown * (1f - baselineDriftRate)
-            gazeUpBaseline   = gazeUpBaseline   * baselineDriftRate + rawGazeUp   * (1f - baselineDriftRate)
+            // Un-tracked or blinking: default to baseline to maintain zero-centered output
+            rawYaw = yawBaseline
+            rawPitch = pitchBaseline
         }
 
-        val relGazeDown = (rawGazeDown - gazeDownBaseline).coerceAtLeast(0f)
-        val relGazeUp   = (rawGazeUp   - gazeUpBaseline  ).coerceAtLeast(0f)
+        // Apply active calibration biases and thresholds to map raw gaze into [-1.0, 1.0] range
+        val offsetX = rawYaw - yawBaseline
+        val offsetY = rawPitch - pitchBaseline
 
-        // Smooth relative scores and deviations using our high-velocity One Euro Filters
-        val now = System.currentTimeMillis()
-        val filteredYawDev = filterHeadYaw?.filter(yawDev.toDouble(), now)?.toFloat() ?: yawDev
-        val filteredPitchDev = filterHeadPitch?.filter(pitchDev.toDouble(), now)?.toFloat() ?: pitchDev
+        val dx = offsetX + horizontalBias
+        val dy = offsetY + verticalBias
 
-        val filteredGazeDown = filterGazeDown?.filter(relGazeDown.toDouble(), now)?.toFloat() ?: relGazeDown
-        val filteredGazeUp = filterGazeUp?.filter(relGazeUp.toDouble(), now)?.toFloat() ?: relGazeUp
+        var calibX = if (dx > 0) {
+            dx / if (rightThreshold != 0f) rightThreshold else 0.1f
+        } else {
+            dx / if (leftThreshold != 0f) Math.abs(leftThreshold) else 0.1f
+        }
 
-        smoothedGazeDown = smoothedGazeDown * gazeSmoothing + filteredGazeDown * (1f - gazeSmoothing)
-        smoothedGazeUp   = smoothedGazeUp   * gazeSmoothing + filteredGazeUp   * (1f - gazeSmoothing)
+        var calibY = if (dy > 0) {
+            dy / if (bottomThreshold != 0f) bottomThreshold else 0.1f
+        } else {
+            dy / if (topThreshold != 0f) Math.abs(topThreshold) else 0.1f
+        }
 
-        val lookThresholdDown = if (customBottomThreshold != 0f) Math.abs(customBottomThreshold) else (0.12f - (sensitivity * 0.06f))
-        val lookThresholdUp   = if (customTopThreshold != 0f) Math.abs(customTopThreshold) else (0.12f - (sensitivity * 0.06f))
+        calibX = calibX.coerceIn(-1.0f, 1.0f)
+        calibY = calibY.coerceIn(-1.0f, 1.0f)
 
-        val eyeSignalMinimumDown = lookThresholdDown * 0.70f
-        val eyeSignalMinimumUp   = lookThresholdUp * 0.70f
+        val finalX = calibrationMatrix[0] * calibX + calibrationMatrix[1] * calibY + calibrationMatrix[2]
+        val finalY = calibrationMatrix[3] * calibX + calibrationMatrix[4] * calibY + calibrationMatrix[5]
 
-        val pitchDownAssist = filteredPitchDev.coerceAtLeast(0f) * 0.3f
-        val pitchUpAssist   = (-filteredPitchDev).coerceAtLeast(0f) * 0.3f
+        val smoothed = safetyEngine.applyAdaptiveSmoothing(finalX, finalY, confidence, now)
+        smoothedYaw = smoothed.first
+        smoothedPitch = smoothed.second
 
-        val isLookingDown = gazeBaselineReady && isAttentive
-                && smoothedGazeDown >= eyeSignalMinimumDown
-                && (smoothedGazeDown + pitchDownAssist) >= lookThresholdDown
+        val hysteresisResult = directionHysteresis.applyHysteresis(smoothedYaw, smoothedPitch, sensitivity)
+        val isLookingDown = hysteresisResult.isLookingDown
+        val isLookingUp = hysteresisResult.isLookingUp
 
-        val isLookingUp = gazeBaselineReady && isAttentive
-                && smoothedGazeUp >= eyeSignalMinimumUp
-                && (smoothedGazeUp + pitchUpAssist) >= lookThresholdUp
+        gazeStateMachine.evaluateState(confidence, isLookingDown || isLookingUp, isBlinking)
 
-        // ── 6. Head-nod detection — FIX C ────────────────────────────────────
-        //
-        // PROBLEM (original): An instantaneous threshold check fired nods on
-        //   any micro-movement (hand tremor, phone shift) that briefly crossed
-        //   the line.  There was no requirement for the deviation to peak-and-
-        //   return, which is the physical signature of a genuine nod.
-        //
-        // FIX: Three-phase state machine (IDLE → ARMED → FIRED → IDLE).
-        //   • ARMED when deviation first exceeds threshold.
-        //   • FIRED only when deviation returns to ≤40 % of its peak while still
-        //     within nodMaxDurationMs.  Movements held longer than that are
-        //     treated as sustained posture changes, not nods.
-        //   • Re-arms only after deviation fully returns to near-neutral.
-        // Re-use already declared 'now' timestamp for head-nod checks
-
-        // Nod thresholds in IOD-normalised units.
-        // A small but deliberate nod moves ~0.06–0.10 IOD units.
-        // sensitivity=0.5 gives yaw=0.065, pitch=0.033 — tuned for phone-held-in-hand use.
-        val yawNodThreshold   = 0.07f - (sensitivity * 0.025f)   // range: 0.045–0.070
-        val pitchNodThreshold = 0.035f - (sensitivity * 0.012f)  // range: 0.023–0.035
+        val yawNodThreshold   = 0.07f - (sensitivity * 0.025f)
+        val pitchNodThreshold = 0.035f - (sensitivity * 0.012f)
 
         var isNodLeft  = false
         var isNodRight = false
         var isNodUp    = false
         var isNodDown  = false
 
-        if ((now - lastScrollTime) > scrollCooldownMs) {
-
-            // ── Yaw nod (left / right) ──────────────────────────────────────
+        if (gazeStateMachine.currentState == GazeStateEnum.STABLE_LOCK && (now - lastScrollTime) > scrollCooldownMs) {
             when (yawNodPhase) {
                 NodPhase.IDLE -> {
-                    // Must be looking at screen to *start* a nod
-                    if (isAttentive && Math.abs(yawDev) > yawNodThreshold) {
+                    if (Math.abs(yawDev) > yawNodThreshold) {
                         yawNodPhase     = NodPhase.ARMED
                         yawNodDirection = if (yawDev > 0) 1 else -1
                         yawNodPeak      = yawDev
@@ -830,37 +667,30 @@ class GazeForegroundService : Service() {
                     }
                 }
                 NodPhase.ARMED -> {
-                    // Keep tracking the peak magnitude
                     if (Math.abs(yawDev) > Math.abs(yawNodPeak)) yawNodPeak = yawDev
-
                     val hasReturned = Math.abs(yawDev) < Math.abs(yawNodPeak) * nodReturnFraction
                     val timedOut    = (now - yawNodStartTime) > nodMaxDurationMs
 
                     when {
                         hasReturned -> {
-                            // Clean peak-and-return → confirmed nod
                             yawNodPhase = NodPhase.FIRED
                             if (yawNodDirection > 0) isNodRight = true else isNodLeft = true
                         }
                         timedOut -> {
-                            // Held too long → sustained posture change, not a nod
                             yawNodPhase = NodPhase.IDLE
                         }
                     }
                 }
                 NodPhase.FIRED -> {
-                    // Wait for full return to neutral so one nod doesn't fire twice
                     if (Math.abs(yawDev) < yawNodThreshold * 0.5f) {
                         yawNodPhase = NodPhase.IDLE
                     }
                 }
             }
 
-            // ── Pitch nod (up / down) ────────────────────────────────────────
             when (pitchNodPhase) {
                 NodPhase.IDLE -> {
-                    // Must be looking at screen to *start* a nod
-                    if (isAttentive && Math.abs(pitchDev) > pitchNodThreshold) {
+                    if (Math.abs(pitchDev) > pitchNodThreshold) {
                         pitchNodPhase     = NodPhase.ARMED
                         pitchNodDirection = if (pitchDev > 0) 1 else -1
                         pitchNodPeak      = pitchDev
@@ -869,7 +699,6 @@ class GazeForegroundService : Service() {
                 }
                 NodPhase.ARMED -> {
                     if (Math.abs(pitchDev) > Math.abs(pitchNodPeak)) pitchNodPeak = pitchDev
-
                     val hasReturned = Math.abs(pitchDev) < Math.abs(pitchNodPeak) * nodReturnFraction
                     val timedOut    = (now - pitchNodStartTime) > nodMaxDurationMs
 
@@ -891,62 +720,123 @@ class GazeForegroundService : Service() {
             }
         }
 
-        // ── 7. Diagnostics log (throttled) ────────────────────────────────────
-        //   IOD is logged so you can verify it stays in [0.05, 0.40] range —
-        //   values outside that range indicate a normalization or rotation problem.
-        //
-        // BUG (previous): Java-style %-placeholders were in the string literal
-        //   but .format() was chained on the string rather than passed to Log.d,
-        //   so Android logcat printed the placeholders literally, not the values.
-        //   Fix: pre-format each value into a local val, then use Kotlin templates.
+        // Diagnostics
         if (faceCount % 15 == 0) {
-            val pd  = "%.4f".format(pitchDev)
-            val yd  = "%.4f".format(yawDev)
-            val sd  = "%.3f".format(smoothedGazeDown)   // relative (baseline-subtracted)
-            val su  = "%.3f".format(smoothedGazeUp)
-            val ds  = "%.3f".format(smoothedGazeDown + pitchDownAssist)
-            val us  = "%.3f".format(smoothedGazeUp   + pitchUpAssist)
-            val db  = "%.3f".format(gazeDownBaseline)
-            val ub  = "%.3f".format(gazeUpBaseline)
-            val thrD = "%.3f".format(lookThresholdDown)
-            val thrU = "%.3f".format(lookThresholdUp)
-            val emD  = "%.3f".format(eyeSignalMinimumDown)
-            val emU  = "%.3f".format(eyeSignalMinimumUp)
-            val iodStr = "%.4f".format(iodNorm)
-            Log.d(TAG,
-                "Gaze | IOD=$iodStr PitchDev=$pd YawDev=$yd | " +
-                "RelDown=$sd(base=$db) RelUp=$su(base=$ub) | " +
-                "DownScore=$ds UpScore=$us | ThreshD=$thrD ThreshU=$thrU EyeMinD=$emD EyeMinU=$emU | " +
-                "LookDown=$isLookingDown LookUp=$isLookingUp Attentive=$isAttentive"
-            )
+            Log.d(TAG, "Gaze System | State=${gazeStateMachine.currentState} Confidence=${"%.2f".format(confidence)} | SmoothedYaw=${"%.3f".format(smoothedYaw)} SmoothedPitch=${"%.3f".format(smoothedPitch)} | LookDown=$isLookingDown LookUp=$isLookingUp")
         }
 
-        // ── 8. Publish + act ─────────────────────────────────────────────────
         val state = GazeState(
             isFaceDetected = true,
-            isAttentive    = isAttentive,
+            isAttentive    = (gazeStateMachine.currentState == GazeStateEnum.STABLE_LOCK || gazeStateMachine.currentState == GazeStateEnum.ACTION_READY),
             isLookingDown  = isLookingDown,
             isLookingUp    = isLookingUp,
             isBlinking     = isBlinking,
-            yaw            = yawDev,
-            pitch          = pitchDev,
+            yaw            = smoothedYaw,
+            pitch          = smoothedPitch,
             eyeOpenness    = eyeOpenness,
             isNodLeft      = isNodLeft,
             isNodRight     = isNodRight,
             isNodUp        = isNodUp,
-            isNodDown      = isNodDown
+            isNodDown      = isNodDown,
+            rawConfidence  = confidence,
+            internalState  = gazeStateMachine.currentState.name
         )
 
         publishGazeState(state)
         handleGazeStateAction(state)
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Gesture dispatch
-    // ─────────────────────────────────────────────────────────────────────────
+    private fun getEyeBoundingBox(face: List<NormalizedLandmark>?, isLeft: Boolean, width: Int, height: Int): RectF {
+        val indices = if (isLeft) {
+            intArrayOf(33, 133, 159, 145, 160, 158, 153, 144)
+        } else {
+            intArrayOf(263, 362, 386, 374, 385, 387, 373, 380)
+        }
+
+        var minX = Float.MAX_VALUE
+        var maxX = -Float.MAX_VALUE
+        var minY = Float.MAX_VALUE
+        var maxY = -Float.MAX_VALUE
+
+        if (face != null) {
+            for (idx in indices) {
+                if (idx < face.size) {
+                    val lm = face[idx]
+                    val x = lm.x() * width
+                    val y = lm.y() * height
+                    if (x < minX) minX = x
+                    if (x > maxX) maxX = x
+                    if (y < minY) minY = y
+                    if (y > maxY) maxY = y
+                }
+            }
+        }
+
+        val paddingX = (maxX - minX) * 0.25f
+        val paddingY = (maxY - minY) * 0.25f
+
+        return RectF(
+            (minX - paddingX).coerceAtLeast(0f),
+            (minY - paddingY).coerceAtLeast(0f),
+            (maxX + paddingX).coerceAtMost(width.toFloat()),
+            (maxY + paddingY).coerceAtMost(height.toFloat())
+        )
+    }
+
+    private fun cropBitmapSafe(src: Bitmap, rect: RectF): Bitmap? {
+        val x = rect.left.toInt()
+        val y = rect.top.toInt()
+        val w = (rect.right - rect.left).toInt()
+        val h = (rect.bottom - rect.top).toInt()
+
+        if (w <= 0 || h <= 0 || x < 0 || y < 0 || x + w > src.width || y + h > src.height) {
+            return null
+        }
+        return Bitmap.createBitmap(src, x, y, w, h)
+    }
+
+    private fun runL2CSNetInference(leftEye: Bitmap, rightEye: Bitmap): Pair<Float, Float> {
+        val runner = reflectiveRunner
+        if (runner == null) {
+            return Pair(devicePitchDeg * 0.01f, deviceYawDeg * 0.01f)
+        }
+
+        try {
+            val numChannels = 3
+            val numElements = numChannels * inputSize * inputSize
+            val floatBuffer = FloatBuffer.allocate(numElements)
+
+            val leftPixels = IntArray(inputSize * inputSize)
+            leftEye.getPixels(leftPixels, 0, inputSize, 0, 0, inputSize, inputSize)
+
+            for (c in 0 until numChannels) {
+                for (i in 0 until inputSize * inputSize) {
+                    val pix = leftPixels[i]
+                    val channelValue = when (c) {
+                        0 -> ((pix shr 16) and 0xFF) / 255.0f
+                        1 -> ((pix shr 8) and 0xFF) / 255.0f
+                        else -> (pix and 0xFF) / 255.0f
+                    }
+                    floatBuffer.put(channelValue)
+                }
+            }
+            floatBuffer.rewind()
+
+            val shape = longArrayOf(1, numChannels.toLong(), inputSize.toLong(), inputSize.toLong())
+            val output = runner.runInference(floatBuffer, shape)
+            if (output != null) {
+                return output
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "ONNX Inference execution error: ${e.message}")
+        }
+        return Pair(devicePitchDeg * 0.01f, deviceYawDeg * 0.01f)
+    }
 
     private fun handleGazeStateAction(state: GazeState) {
         val activeApp = GazeAccessibilityService.activePackageName
+        val profile = profileManager.getProfile(activeApp)
+
         val isSupported = systemWide
                 || enabledApps.isEmpty()
                 || enabledApps.contains(activeApp)
@@ -961,49 +851,57 @@ class GazeForegroundService : Service() {
 
         val now = System.currentTimeMillis()
 
-        // ── Horizontal nods (always active regardless of swipeMode) ───────────
+        if (!safetyEngine.allowAction(now, profile.config.minIntervalMs)) {
+            return
+        }
+
         if ((now - lastScrollTime) > scrollCooldownMs) {
             if (state.isNodLeft) {
                 GazeAccessibilityService.instance?.performScrollLeft(scrollSpeed)
                 lastScrollTime = now
+                safetyEngine.recordAction(now)
                 updateNotification("Gaze Service Active", "Swiped left via head nod.")
                 return
             }
             if (state.isNodRight) {
                 GazeAccessibilityService.instance?.performScrollRight(scrollSpeed)
                 lastScrollTime = now
+                safetyEngine.recordAction(now)
                 updateNotification("Gaze Service Active", "Swiped right via head nod.")
                 return
             }
         }
 
-        // ── Vertical actions: mode-dependent ─────────────────────────────────
         if (swipeMode == "headNod") {
             if ((now - lastScrollTime) > scrollCooldownMs) {
                 when {
                     state.isNodDown -> {
                         GazeAccessibilityService.instance?.performScrollDown(scrollSpeed)
                         lastScrollTime = now
+                        safetyEngine.recordAction(now)
                         updateNotification("Gaze Service Active", "Scrolled down via head nod.")
                     }
                     state.isNodUp -> {
                         GazeAccessibilityService.instance?.performScrollUp(scrollSpeed)
                         lastScrollTime = now
+                        safetyEngine.recordAction(now)
                         updateNotification("Gaze Service Active", "Scrolled up via head nod.")
                     }
                 }
             }
         } else if (swipeMode == "eyeTracking") {
-            // Eye-tracking hold mode
+            val activeDwell = profile.stabilityDurationMs
+
             if (state.isLookingDown) {
                 if (lookingDownStartTime == 0L) {
                     lookingDownStartTime = now
                 } else {
                     val elapsed = now - lookingDownStartTime
-                    if (elapsed >= triggerDurationMs && (now - lastScrollTime) > scrollCooldownMs) {
+                    if (elapsed >= activeDwell && (now - lastScrollTime) > scrollCooldownMs) {
                         GazeAccessibilityService.instance?.performScrollDown(scrollSpeed)
                         lastScrollTime       = now
                         lookingDownStartTime = 0L
+                        safetyEngine.recordAction(now)
                         updateNotification("Gaze Service Active", "Scrolled down via eye gaze.")
                     }
                 }
@@ -1016,10 +914,11 @@ class GazeForegroundService : Service() {
                     lookingUpStartTime = now
                 } else {
                     val elapsed = now - lookingUpStartTime
-                    if (elapsed >= triggerDurationMs && (now - lastScrollTime) > scrollCooldownMs) {
+                    if (elapsed >= activeDwell && (now - lastScrollTime) > scrollCooldownMs) {
                         GazeAccessibilityService.instance?.performScrollUp(scrollSpeed)
                         lastScrollTime     = now
                         lookingUpStartTime = 0L
+                        safetyEngine.recordAction(now)
                         updateNotification("Gaze Service Active", "Scrolled up via eye gaze.")
                     }
                 }
@@ -1028,7 +927,6 @@ class GazeForegroundService : Service() {
             }
         }
 
-        // ── Media play/pause on look-away ─────────────────────────────────────
         if (pauseOnLookAway) {
             val isAttentionLost = Math.abs(state.yaw) > 0.35f || Math.abs(state.pitch) > 0.30f
             val isAttentionRegained = Math.abs(state.yaw) < 0.20f && Math.abs(state.pitch) < 0.15f
@@ -1062,76 +960,14 @@ class GazeForegroundService : Service() {
     }
 
     private fun triggerGlobalPlayPause() {
-        Log.d(TAG, "Dispatching KEYCODE_MEDIA_PLAY_PAUSE")
         val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
         audioManager.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE))
         audioManager.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE))
     }
 
-    private fun triggerGlobalStop() {
-        Log.d(TAG, "Dispatching KEYCODE_MEDIA_STOP")
-        val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        audioManager.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_MEDIA_STOP))
-        audioManager.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_MEDIA_STOP))
-    }
-
-    private fun triggerGlobalSelect() {
-        Log.d(TAG, "Dispatching Select (Click center of screen)")
-        val dm = resources.displayMetrics
-        val cx = (dm.widthPixels / 2).toFloat()
-        val cy = (dm.heightPixels / 2).toFloat()
-        val path = Path().apply { moveTo(cx, cy) }
-        val gestureBuilder = GestureDescription.Builder()
-        gestureBuilder.addStroke(GestureDescription.StrokeDescription(path, 0, 50))
-        GazeAccessibilityService.instance?.dispatchGesture(
-            gestureBuilder.build(),
-            null,
-            null
-        )
-    }
-
-    private fun triggerSwipeLeft() {
-        flagSwipeLeft = true
-        GazeAccessibilityService.instance?.performScrollLeft(scrollSpeed)
-        updateNotification("Gaze Service Active", "Swiped left via hand gesture.")
-        Log.i(TAG, "Triggered Swipe Left via hand gesture.")
-    }
-    
-    private fun triggerSwipeRight() {
-        flagSwipeRight = true
-        GazeAccessibilityService.instance?.performScrollRight(scrollSpeed)
-        updateNotification("Gaze Service Active", "Swiped right via hand gesture.")
-        Log.i(TAG, "Triggered Swipe Right via hand gesture.")
-    }
-
-    private fun triggerSwipeUp() {
-        flagSwipeUp = true
-        GazeAccessibilityService.instance?.performScrollUp(scrollSpeed)
-        updateNotification("Gaze Service Active", "Scrolled up via hand gesture.")
-        Log.i(TAG, "Triggered Scroll Up via hand gesture.")
-    }
-
-    private fun triggerSwipeDown() {
-        flagSwipeDown = true
-        GazeAccessibilityService.instance?.performScrollDown(scrollSpeed)
-        updateNotification("Gaze Service Active", "Scrolled down via hand gesture.")
-        Log.i(TAG, "Triggered Scroll Down via hand gesture.")
-    }
-
-    private fun triggerPalmGesture(gesture: String) {
-        Log.i(TAG, "Palm Gesture Confirmed: $gesture")
-        updateNotification("Gaze Service Active", "Triggered $gesture palm gesture.")
-        when (gesture) {
-            "OPEN_PALM" -> triggerGlobalPlayPause()
-            "CLOSED_FIST" -> triggerGlobalStop()
-            "THUMBS_UP" -> triggerGlobalSelect()
-        }
-    }
-
     private fun processHandLandmarks(result: HandLandmarkerResult) {
         val landmarks = result.landmarks()
         if (landmarks.isNullOrEmpty() || landmarks[0].size <= 20) {
-            // Hand lost -> reset swipe history and stable palm state
             swipeHistory.clear()
             currentHandGesture = "NONE"
             lastStabilityGesture = "NONE"
@@ -1144,7 +980,6 @@ class GazeForegroundService : Service() {
         val wrist = hand[0]
         val wristPoint = android.graphics.PointF(wrist.x(), wrist.y())
 
-        // 1. Swipe classification using velocity + distance
         swipeHistory.add(Pair(now, wristPoint))
         while (swipeHistory.isNotEmpty() && now - swipeHistory[0].first > 800L) {
             swipeHistory.removeAt(0)
@@ -1165,9 +1000,11 @@ class GazeForegroundService : Service() {
                 if (Math.abs(dx) > Math.abs(dy)) {
                     if (Math.abs(vx) > 0.4f) {
                         if (dx > 0) {
-                            triggerSwipeRight()
+                            flagSwipeRight = true
+                            GazeAccessibilityService.instance?.performScrollRight(scrollSpeed)
                         } else {
-                            triggerSwipeLeft()
+                            flagSwipeLeft = true
+                            GazeAccessibilityService.instance?.performScrollLeft(scrollSpeed)
                         }
                         lastSwipeTriggeredTime = now
                         swipeHistory.clear()
@@ -1175,9 +1012,11 @@ class GazeForegroundService : Service() {
                 } else {
                     if (Math.abs(vy) > 0.4f) {
                         if (dy > 0) {
-                            triggerSwipeDown()
+                            flagSwipeDown = true
+                            GazeAccessibilityService.instance?.performScrollDown(scrollSpeed)
                         } else {
-                            triggerSwipeUp()
+                            flagSwipeUp = true
+                            GazeAccessibilityService.instance?.performScrollUp(scrollSpeed)
                         }
                         lastSwipeTriggeredTime = now
                         swipeHistory.clear()
@@ -1186,7 +1025,6 @@ class GazeForegroundService : Service() {
             }
         }
 
-        // 2. Stable Palm Gesture classification
         val dist = { p1: com.google.mediapipe.tasks.components.containers.NormalizedLandmark, p2: com.google.mediapipe.tasks.components.containers.NormalizedLandmark ->
             val dx = p1.x() - p2.x()
             val dy = p1.y() - p2.y()
@@ -1216,7 +1054,9 @@ class GazeForegroundService : Service() {
         if (currentGesture == lastStabilityGesture && currentGesture != "NONE") {
             val elapsed = now - gestureStabilityStartTime
             if (elapsed >= stabilityDurationMs && currentGesture != lastTriggeredPalmGesture && (now - lastPalmGestureTriggerTime > palmGestureCooldownMs)) {
-                triggerPalmGesture(currentGesture)
+                when (currentGesture) {
+                    "OPEN_PALM" -> triggerGlobalPlayPause()
+                }
                 lastTriggeredPalmGesture = currentGesture
                 lastPalmGestureTriggerTime = now
             }
@@ -1245,7 +1085,6 @@ class GazeForegroundService : Service() {
         flagSwipeDown = false
     }
 
-    /** Convenience to build a fully-false/zero GazeState when no face is detected. */
     private fun emptyGazeState() = GazeState(
         isFaceDetected = false, isAttentive = false,
         isLookingDown  = false, isLookingUp  = false,
@@ -1253,10 +1092,6 @@ class GazeForegroundService : Service() {
         isNodLeft = false, isNodRight = false, isNodUp = false, isNodDown = false,
         detectedHandGesture = "NONE", isSwipeLeft = false, isSwipeRight = false, isSwipeUp = false, isSwipeDown = false
     )
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // Camera2 plumbing
-    // ─────────────────────────────────────────────────────────────────────────
 
     private fun startBackgroundThread() {
         cameraThread  = HandlerThread("CameraBackground").also { it.start() }
@@ -1279,7 +1114,6 @@ class GazeForegroundService : Service() {
     }
 
     private fun startCameraProcessing() {
-        Log.i(TAG, "=====> Initialising front-camera frame capture <=====")
         val cameraManager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
         try {
             var frontCameraId: String? = null
@@ -1289,13 +1123,11 @@ class GazeForegroundService : Service() {
                 if (facing == CameraCharacteristics.LENS_FACING_FRONT) {
                     frontCameraId     = id
                     sensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 270
-                    Log.i(TAG, "Front camera found. Sensor orientation: $sensorOrientation°")
                     break
                 }
             }
 
             if (frontCameraId == null) {
-                Log.e(TAG, "No front camera found.")
                 startFallbackHeuristicSimulator()
                 return
             }
@@ -1303,30 +1135,25 @@ class GazeForegroundService : Service() {
             if (ContextCompat.checkSelfPermission(this, android.Manifest.permission.CAMERA)
                 != PackageManager.PERMISSION_GRANTED
             ) {
-                Log.e(TAG, "Camera permission not granted.")
                 startFallbackHeuristicSimulator()
                 return
             }
 
             cameraManager.openCamera(frontCameraId, object : CameraDevice.StateCallback() {
                 override fun onOpened(camera: CameraDevice) {
-                    Log.i(TAG, "Camera opened. Building capture session…")
                     cameraDevice = camera
                     createCameraPreviewSession()
                 }
                 override fun onDisconnected(camera: CameraDevice) {
-                    Log.w(TAG, "Camera disconnected.")
                     camera.close(); cameraDevice = null
                 }
                 override fun onError(camera: CameraDevice, error: Int) {
-                    Log.e(TAG, "Camera error: $error")
                     camera.close(); cameraDevice = null
                     startFallbackHeuristicSimulator()
                 }
             }, cameraHandler)
 
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to open camera: ${e.message}")
             startFallbackHeuristicSimulator()
         }
     }
@@ -1349,7 +1176,6 @@ class GazeForegroundService : Service() {
                     captureSession = session
                     try {
                         session.setRepeatingRequest(requestBuilder.build(), null, cameraHandler)
-                        Log.i(TAG, "Capture session configured.")
                     } catch (e: Exception) {
                         Log.e(TAG, "Failed to start repeating request: ${e.message}")
                     }
@@ -1397,7 +1223,6 @@ class GazeForegroundService : Service() {
             faceLandmarker?.detectAsync(mpImage, opts, now)
             handLandmarker?.detectAsync(mpImage, opts, now)
         } catch (e: Exception) {
-            Log.e(TAG, "Frame processing error: ${e.message}")
             image.close()
         }
     }
@@ -1415,7 +1240,6 @@ class GazeForegroundService : Service() {
         val w = image.width
         val h = image.height
 
-        // Pre-allocated array cache optimization (production grade)
         val size = w * h
         if (cachedPixels == null || cachedPixels!!.size != size) {
             cachedPixels = IntArray(size)
@@ -1449,31 +1273,25 @@ class GazeForegroundService : Service() {
     }
 
     private fun stopCameraProcessing() {
-        Log.i(TAG, "=====> Stopping camera <=====")
         try { captureSession?.stopRepeating(); captureSession?.close() }
-        catch (e: Exception) { Log.e(TAG, "Error closing capture session: ${e.message}") }
+        catch (e: Exception) { }
         captureSession = null
 
         try { cameraDevice?.close() }
-        catch (e: Exception) { Log.e(TAG, "Error closing camera device: ${e.message}") }
+        catch (e: Exception) { }
         cameraDevice = null
 
         try { imageReader?.close() }
-        catch (e: Exception) { Log.e(TAG, "Error closing ImageReader: ${e.message}") }
+        catch (e: Exception) { }
         imageReader = null
 
         stopBackgroundThread()
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Fallback heuristic simulator (used when camera/MediaPipe unavailable)
-    // ─────────────────────────────────────────────────────────────────────────
-
     private var simulatorHandler: Handler? = null
     private var simulatorTickCount = 0
 
     private fun startFallbackHeuristicSimulator() {
-        Log.w(TAG, "Starting fallback heuristic simulator — no real gaze data.")
         simulatorHandler = Handler(Looper.getMainLooper())
 
         val runnable = object : Runnable {
@@ -1539,18 +1357,425 @@ class GazeForegroundService : Service() {
                 pitchBaseline = neutralY
                 baselineInitialized = true
 
-                customTopThreshold = json.optDouble("top_threshold", 0.08).toFloat()
-                customBottomThreshold = json.optDouble("bottom_threshold", -0.08).toFloat()
+                if (json.has("top_threshold")) topThreshold = json.getDouble("top_threshold").toFloat()
+                if (json.has("bottom_threshold")) bottomThreshold = json.getDouble("bottom_threshold").toFloat()
+                if (json.has("left_threshold")) leftThreshold = json.getDouble("left_threshold").toFloat()
+                if (json.has("right_threshold")) rightThreshold = json.getDouble("right_threshold").toFloat()
+                if (json.has("vertical_bias")) verticalBias = json.getDouble("vertical_bias").toFloat()
+                if (json.has("horizontal_bias")) horizontalBias = json.getDouble("horizontal_bias").toFloat()
+                if (json.has("deadzone_radius")) deadzoneRadius = json.getDouble("deadzone_radius").toFloat()
 
-                // Instantly seed dynamic gaze baselines and ready states
-                gazeDownBaseline = 0f
-                gazeUpBaseline = 0f
-                gazeBaselineReady = true
-
-                Log.i(TAG, "Loaded active custom baseline calibration: neutralX=$neutralX neutralY=$neutralY top=$customTopThreshold bottom=$customBottomThreshold")
+                if (json.has("calibration_matrix")) {
+                    val mat = json.getJSONArray("calibration_matrix")
+                    for (i in 0 until 6) {
+                        calibrationMatrix[i] = mat.getDouble(i).toFloat()
+                    }
+                }
             }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to load personalized calibration baseline: ${e.message}")
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 1. EYE CROP STABILIZER (Affine Alignment & Temporal Box Smoothing)
+    // ─────────────────────────────────────────────────────────────────────────
+    inner class CropStabilizer {
+        private var prevRectLeft = RectF()
+        private var prevRectRight = RectF()
+        private val smoothingAlpha = 0.25f 
+
+        fun getStabilizedEyeBoundingBox(face: List<NormalizedLandmark>, isLeft: Boolean, width: Int, height: Int): RectF {
+            val indices = if (isLeft) {
+                intArrayOf(33, 133, 159, 145, 160, 158, 153, 144)
+            } else {
+                intArrayOf(263, 362, 386, 374, 385, 387, 373, 380)
+            }
+
+            var minX = Float.MAX_VALUE
+            var maxX = -Float.MAX_VALUE
+            var minY = Float.MAX_VALUE
+            var maxY = -Float.MAX_VALUE
+
+            for (idx in indices) {
+                if (idx < face.size) {
+                    val lm = face[idx]
+                    val x = lm.x() * width
+                    val y = lm.y() * height
+                    if (x < minX) minX = x
+                    if (x > maxX) maxX = x
+                    if (y < minY) minY = y
+                    if (y > maxY) maxY = y
+                }
+            }
+
+            val rawW = maxX - minX
+            val rawH = maxY - minY
+            val paddingX = rawW * 0.30f
+            val paddingY = rawH * 0.30f
+
+            val targetRect = RectF(
+                (minX - paddingX).coerceAtLeast(0f),
+                (minY - paddingY).coerceAtLeast(0f),
+                (maxX + paddingX).coerceAtMost(width.toFloat()),
+                (maxY + paddingY).coerceAtMost(height.toFloat())
+            )
+
+            val prevRect = if (isLeft) prevRectLeft else prevRectRight
+            if (prevRect.isEmpty) {
+                if (isLeft) prevRectLeft = targetRect else prevRectRight = targetRect
+                return targetRect
+            }
+
+            val stableRect = RectF(
+                prevRect.left * (1f - smoothingAlpha) + targetRect.left * smoothingAlpha,
+                prevRect.top * (1f - smoothingAlpha) + targetRect.top * smoothingAlpha,
+                prevRect.right * (1f - smoothingAlpha) + targetRect.right * smoothingAlpha,
+                prevRect.bottom * (1f - smoothingAlpha) + targetRect.bottom * smoothingAlpha
+            )
+
+            if (isLeft) prevRectLeft = stableRect else prevRectRight = stableRect
+            return stableRect
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 2. CONFIDENCE ESTIMATION SYSTEM
+    // ─────────────────────────────────────────────────────────────────────────
+    inner class ConfidenceEngine {
+        fun calculateConfidence(
+            face: List<NormalizedLandmark>,
+            isBlinking: Boolean,
+            gyroMagnitude: Float,
+            headYaw: Float,
+            headPitch: Float
+        ): Float {
+            if (isBlinking) return 0.05f
+
+            var landmarkScore = 1.0f
+            val criticalIndices = intArrayOf(33, 133, 263, 362, 1, 10, 152)
+            var validPoints = 0
+            for (idx in criticalIndices) {
+                if (idx < face.size) {
+                    val lm = face[idx]
+                    if (lm.x() in 0.0f..1.0f && lm.y() in 0.0f..1.0f) {
+                        validPoints++
+                    }
+                }
+            }
+            landmarkScore = validPoints.toFloat() / criticalIndices.size.toFloat()
+
+            val tiltPenalty = (Math.abs(headYaw) * 0.4f + Math.abs(headPitch) * 0.4f).coerceAtMost(0.3f)
+            val motionPenalty = (gyroMagnitude * 0.07f).coerceAtMost(0.4f)
+
+            return (landmarkScore - tiltPenalty - motionPenalty).coerceIn(0f, 1f)
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 3. GAZE STATE MACHINE
+    // ─────────────────────────────────────────────────────────────────────────
+    inner class GazeStateMachine {
+        var currentState = GazeStateEnum.SEARCHING
+            private set
+        private var stableLockStartTime = 0L
+
+        fun updateState(newState: GazeStateEnum) {
+            if (currentState != newState) {
+                currentState = newState
+            }
+        }
+
+        fun evaluateState(confidence: Float, isLookingAway: Boolean, isBlinking: Boolean) {
+            val now = System.currentTimeMillis()
+            when (currentState) {
+                GazeStateEnum.NO_FACE -> {
+                    if (confidence > 0.45f) currentState = GazeStateEnum.SEARCHING
+                }
+                GazeStateEnum.SEARCHING -> {
+                    if (confidence > 0.65f && !isLookingAway && !isBlinking) {
+                        currentState = GazeStateEnum.TRACKING
+                    } else if (confidence <= 0.35f) {
+                        currentState = GazeStateEnum.NO_FACE
+                    }
+                }
+                GazeStateEnum.TRACKING -> {
+                    if (isLookingAway && !isBlinking) {
+                        stableLockStartTime = now
+                        currentState = GazeStateEnum.UNSTABLE
+                    } else if (confidence < 0.50f) {
+                        currentState = GazeStateEnum.UNSTABLE
+                    } else if (confidence > 0.75f && !isLookingAway && !isBlinking) {
+                        currentState = GazeStateEnum.STABLE_LOCK
+                    }
+                }
+                GazeStateEnum.UNSTABLE -> {
+                    if (confidence > 0.65f && !isLookingAway) {
+                        currentState = GazeStateEnum.TRACKING
+                    } else if (confidence <= 0.30f) {
+                        currentState = GazeStateEnum.SEARCHING
+                    }
+                }
+                GazeStateEnum.STABLE_LOCK -> {
+                    if (isLookingAway) {
+                        currentState = GazeStateEnum.ACTION_READY
+                    } else if (confidence < 0.55f) {
+                        currentState = GazeStateEnum.UNSTABLE
+                    }
+                }
+                GazeStateEnum.ACTION_READY -> {
+                    currentState = GazeStateEnum.COOLDOWN
+                    stableLockStartTime = now
+                }
+                GazeStateEnum.COOLDOWN -> {
+                    if (now - stableLockStartTime > 800L) {
+                        currentState = GazeStateEnum.TRACKING
+                    }
+                }
+            }
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 4. BLINK DETECTION + REJECTION
+    // ─────────────────────────────────────────────────────────────────────────
+    inner class BlinkDetector {
+        fun detectBlink(face: List<NormalizedLandmark>, scores: Map<String, Float>): BlinkResult {
+            val lEAR = if (face.size > 160) {
+                val h1 = Math.sqrt(((face[160].x()-face[144].x()).let { it*it } + (face[160].y()-face[144].y()).let { it*it } + (face[160].z()-face[144].z()).let { it*it }).toDouble()).toFloat()
+                val h2 = Math.sqrt(((face[158].x()-face[153].x()).let { it*it } + (face[158].y()-face[153].y()).let { it*it } + (face[158].z()-face[153].z()).let { it*it }).toDouble()).toFloat()
+                val w  = Math.sqrt(((face[33].x()-face[133].x()).let { it*it } + (face[33].y()-face[133].y()).let { it*it } + (face[33].z()-face[133].z()).let { it*it }).toDouble()).toFloat()
+                (h1 + h2) / (2f * w.coerceAtLeast(0.001f))
+            } else 0.25f
+
+            val rEAR = if (face.size > 387) {
+                val h1 = Math.sqrt(((face[385].x()-face[380].x()).let { it*it } + (face[385].y()-face[380].y()).let { it*it } + (face[385].z()-face[380].z()).let { it*it }).toDouble()).toFloat()
+                val h2 = Math.sqrt(((face[387].x()-face[373].x()).let { it*it } + (face[387].y()-face[373].y()).let { it*it } + (face[387].z()-face[373].z()).let { it*it }).toDouble()).toFloat()
+                val w  = Math.sqrt(((face[263].x()-face[362].x()).let { it*it } + (face[263].y()-face[362].y()).let { it*it } + (face[263].z()-face[362].z()).let { it*it }).toDouble()).toFloat()
+                (h1 + h2) / (2f * w.coerceAtLeast(0.001f))
+            } else 0.25f
+
+            val avgEAR = (lEAR + rEAR) / 2f
+            val leftBlinkScore  = scores["eyeBlinkLeft"]  ?: 0f
+            val rightBlinkScore = scores["eyeBlinkRight"] ?: 0f
+            val avgBlinkScore   = (leftBlinkScore + rightBlinkScore) / 2f
+            val eyeOpenness     = (1f - avgBlinkScore) * 100f
+            
+            val isBlinking      = (avgBlinkScore * 0.55f + (if (avgEAR < 0.21f) 1.0f else 0.0f) * 0.45f) > 0.62f
+
+            return BlinkResult(isBlinking, avgBlinkScore, eyeOpenness)
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 5. DIRECTION HYSTERESIS
+    // ─────────────────────────────────────────────────────────────────────────
+    inner class DirectionHysteresis {
+        private var wasLookingDown = false
+        private var wasLookingUp = false
+
+        fun applyHysteresis(yaw: Float, pitch: Float, sensitivity: Float): HysteresisResult {
+            val baseThreshold = 0.40f - (sensitivity * 0.18f)
+            
+            val enterThreshold = baseThreshold * 1.15f
+            val exitThreshold = baseThreshold * 0.80f
+
+            val isLookingDown = if (wasLookingDown) {
+                pitch > exitThreshold
+            } else {
+                pitch > enterThreshold
+            }
+
+            val isLookingUp = if (wasLookingUp) {
+                pitch < -exitThreshold
+            } else {
+                pitch < -enterThreshold
+            }
+
+            wasLookingDown = isLookingDown
+            wasLookingUp = isLookingUp
+
+            return HysteresisResult(isLookingDown, isLookingUp)
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 6. ACCESSIBILITY SAFETY LAYER & ADAPTIVE SMOOTHING
+    // ─────────────────────────────────────────────────────────────────────────
+    inner class AccessibilitySafetyEngine {
+        private var lastActionTime = 0L
+        private var smoothedYaw = 0f
+        private var smoothedPitch = 0f
+
+        fun allowAction(now: Long, minIntervalMs: Long): Boolean {
+            if (now - lastActionTime < minIntervalMs) {
+                return false
+            }
+            return true
+        }
+
+        fun recordAction(now: Long) {
+            lastActionTime = now
+        }
+
+        fun applyAdaptiveSmoothing(rawX: Float, rawY: Float, confidence: Float, now: Long): Pair<Float, Float> {
+            val baseAlpha = 0.35f
+            val confidenceWeight = confidence * 0.40f
+            val alpha = (baseAlpha + confidenceWeight).coerceIn(0.12f, 0.85f)
+
+            smoothedYaw = smoothedYaw * (1f - alpha) + rawX * alpha
+            smoothedPitch = smoothedPitch * (1f - alpha) + rawY * alpha
+
+            return Pair(smoothedYaw, smoothedPitch)
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 7. THERMAL & PERFORMANCE MANAGER (Dynamic FPS and Throttling)
+    // ─────────────────────────────────────────────────────────────────────────
+    inner class ThermalPerformanceManager {
+        fun getThrottleMs(confidence: Float, state: GazeStateEnum): Long {
+            return when {
+                state == GazeStateEnum.NO_FACE -> 200L 
+                state == GazeStateEnum.UNSTABLE -> 100L 
+                confidence < 0.50f -> 66L 
+                else -> 33L 
+            }
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 8. LONG-SESSION DRIFT CORRECTION
+    // ─────────────────────────────────────────────────────────────────────────
+    inner class DriftCorrectionManager {
+        private var accumulatedDriftYaw = 0f
+        private var accumulatedDriftPitch = 0f
+        private val driftDamping = 0.002f 
+
+        fun applyDriftCorrection(rawYaw: Float, rawPitch: Float) {
+            accumulatedDriftYaw = accumulatedDriftYaw * (1f - driftDamping) + rawYaw * driftDamping
+            accumulatedDriftPitch = accumulatedDriftPitch * (1f - driftDamping) + rawPitch * driftDamping
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 9. PER-APP INTERACTION PROFILES
+    // ─────────────────────────────────────────────────────────────────────────
+    inner class InteractionProfileManager {
+        fun getProfile(packageName: String): AppInteractionProfile {
+            val lower = packageName.lowercase()
+            return when {
+                lower.contains("youtube") || lower.contains("instagram") || lower.contains("tiktok") -> {
+                    AppInteractionProfile(AppGestureConfig(0.82f, 1400L), 250L)
+                }
+                lower.contains("chrome") || lower.contains("pdf") || lower.contains("reader") -> {
+                    AppInteractionProfile(AppGestureConfig(0.50f, 700L), 450L)
+                }
+                else -> {
+                    AppInteractionProfile(AppGestureConfig(0.70f, 800L), 350L)
+                }
+            }
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // ONNX Reflective Runner
+    // ─────────────────────────────────────────────────────────────────────────
+    class OnnxReflectiveRunner(private val context: Context, private val modelPath: String) {
+        private var env: Any? = null
+        private var session: Any? = null
+        private var isInitialized = false
+
+        init {
+            try {
+                val envClass = Class.forName("com.microsoft.onnxruntime.OrtEnvironment")
+                val getEnvMethod = envClass.getMethod("getEnvironment")
+                env = getEnvMethod.invoke(null)
+
+                val sessionOptionsClass = Class.forName("com.microsoft.onnxruntime.OrtSession\$SessionOptions")
+                val sessionOptions = sessionOptionsClass.getDeclaredConstructor().newInstance()
+                
+                try {
+                    val addNnapiMethod = sessionOptionsClass.getMethod("addNnapi")
+                    addNnapiMethod.invoke(sessionOptions)
+                    Log.i("OnnxReflective", "NNAPI enabled reflectively.")
+                } catch (e: Exception) {
+                    Log.w("OnnxReflective", "NNAPI not available reflectively.")
+                }
+
+                val envClassInstance = envClass.cast(env)
+                val createSessionMethod = envClass.getMethod("createSession", String::class.java, sessionOptionsClass)
+                session = createSessionMethod.invoke(envClassInstance, modelPath, sessionOptions)
+                isInitialized = true
+                Log.i("OnnxReflective", "Reflective ONNX Session successfully created.")
+            } catch (e: Exception) {
+                Log.e("OnnxReflective", "Reflective ONNX initialization failed: ${e.message}")
+            }
+        }
+
+        fun runInference(floatBuffer: FloatBuffer, shape: LongArray): Pair<Float, Float>? {
+            if (!isInitialized || env == null || session == null) return null
+            try {
+                val onnxTensorClass = Class.forName("com.microsoft.onnxruntime.OnnxTensor")
+                val createTensorMethod = onnxTensorClass.getMethod(
+                    "createTensor", 
+                    Class.forName("com.microsoft.onnxruntime.OrtEnvironment"), 
+                    FloatBuffer::class.java, 
+                    LongArray::class.java
+                )
+                val inputTensor = createTensorMethod.invoke(null, env, floatBuffer, shape)
+
+                val inputMap = mapOf("input" to inputTensor)
+                val sessionClass = Class.forName("com.microsoft.onnxruntime.OrtSession")
+                val runMethod = sessionClass.getMethod("run", Map::class.java)
+                val outputs = runMethod.invoke(session, inputMap)
+
+                val resultClass = Class.forName("com.microsoft.onnxruntime.OrtSession\$Result")
+                val sizeMethod = resultClass.getMethod("size")
+                val getMethod = resultClass.getMethod("get", Int::class.java)
+
+                val size = sizeMethod.invoke(outputs) as Int
+                if (size > 0) {
+                    val outVal = getMethod.invoke(outputs, 0)
+                    if (onnxTensorClass.isInstance(outVal)) {
+                        val getFloatBufferMethod = onnxTensorClass.getMethod("getFloatBuffer")
+                        val outputData = getFloatBufferMethod.invoke(outVal) as FloatBuffer
+                        outputData.rewind()
+
+                        val pitch = if (outputData.remaining() > 0) outputData.get() else 0f
+                        val yaw = if (outputData.remaining() > 0) outputData.get() else 0f
+
+                        val closeResultMethod = resultClass.getMethod("close")
+                        closeResultMethod.invoke(outputs)
+
+                        val closeTensorMethod = onnxTensorClass.getMethod("close")
+                        closeTensorMethod.invoke(inputTensor)
+
+                        return Pair(pitch, yaw)
+                    }
+                }
+                
+                val closeTensorMethod = onnxTensorClass.getMethod("close")
+                closeTensorMethod.invoke(inputTensor)
+            } catch (e: Exception) {
+                Log.e("OnnxReflective", "Reflective ONNX runtime run failed: ${e.message}")
+            }
+            return null
+        }
+
+        fun close() {
+            try {
+                if (session != null) {
+                    val sessionClass = Class.forName("com.microsoft.onnxruntime.OrtSession")
+                    sessionClass.getMethod("close").invoke(session)
+                }
+                if (env != null) {
+                    val envClass = Class.forName("com.microsoft.onnxruntime.OrtEnvironment")
+                    envClass.getMethod("close").invoke(env)
+                }
+            } catch (e: Exception) {
+                Log.e("OnnxReflective", "Error closing reflective runner: ${e.message}")
+            }
         }
     }
 }

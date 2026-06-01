@@ -1,5 +1,6 @@
 plugins {
     id("com.android.application")
+    id("org.jetbrains.kotlin.android")
     // The Flutter Gradle Plugin must be applied after the Android Gradle plugin.
     id("dev.flutter.flutter-gradle-plugin")
 }
@@ -40,6 +41,7 @@ android {
 
 dependencies {
     implementation("com.google.mediapipe:tasks-vision:0.10.14")
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.17.0")
 }
 
 flutter {

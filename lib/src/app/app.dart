@@ -1,4 +1,3 @@
-import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:forui/forui.dart';
@@ -17,7 +16,7 @@ class App extends ConsumerWidget {
       colors: baseTheme.colors.copyWith(primary: const Color(0xFF39A7FF)),
     );
     return MaterialApp.router(
-      title: 'Gaze',
+      title: 'Gaze Control',
       debugShowCheckedModeBanner: false,
       routeInformationParser: router.routeInformationParser,
       routeInformationProvider: router.routeInformationProvider,

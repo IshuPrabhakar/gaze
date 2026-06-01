@@ -20,6 +20,8 @@ class GazeTelemetryState {
   final bool isSwipeRight;
   final bool isSwipeUp;
   final bool isSwipeDown;
+  final double rawConfidence;
+  final String internalState;
  
   GazeTelemetryState({
     required this.isFaceDetected,
@@ -40,6 +42,8 @@ class GazeTelemetryState {
     required this.isSwipeRight,
     required this.isSwipeUp,
     required this.isSwipeDown,
+    required this.rawConfidence,
+    required this.internalState,
   });
 
   factory GazeTelemetryState.empty() => GazeTelemetryState(
@@ -61,6 +65,8 @@ class GazeTelemetryState {
         isSwipeRight: false,
         isSwipeUp: false,
         isSwipeDown: false,
+        rawConfidence: 1.0,
+        internalState: 'TRACKING',
       );
 
   factory GazeTelemetryState.fromMap(Map<dynamic, dynamic> map) {
@@ -83,6 +89,8 @@ class GazeTelemetryState {
       isSwipeRight: map['isSwipeRight'] as bool? ?? false,
       isSwipeUp: map['isSwipeUp'] as bool? ?? false,
       isSwipeDown: map['isSwipeDown'] as bool? ?? false,
+      rawConfidence: (map['rawConfidence'] as num? ?? 1.0).toDouble(),
+      internalState: map['internalState'] as String? ?? 'TRACKING',
     );
   }
 }

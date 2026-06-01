@@ -82,7 +82,9 @@ class MainActivity : FlutterActivity() {
                                     "isSwipeRight" to state.isSwipeRight,
                                     "isSwipeUp" to state.isSwipeUp,
                                     "isSwipeDown" to state.isSwipeDown,
-                                    "activeApp" to GazeAccessibilityService.activePackageName
+                                    "activeApp" to GazeAccessibilityService.activePackageName,
+                                    "rawConfidence" to state.rawConfidence,
+                                    "internalState" to state.internalState
                                 )
                                 telemetryChannel?.invokeMethod("onGazeStateChanged", data)
                             }
