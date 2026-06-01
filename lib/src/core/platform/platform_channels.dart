@@ -6,6 +6,8 @@ class GazeTelemetryState {
   final bool isAttentive;
   final bool isLookingDown;
   final bool isLookingUp;
+  final bool isLookingLeft;
+  final bool isLookingRight;
   final bool isBlinking;
   final double yaw;
   final double pitch;
@@ -28,6 +30,8 @@ class GazeTelemetryState {
     required this.isAttentive,
     required this.isLookingDown,
     required this.isLookingUp,
+    required this.isLookingLeft,
+    required this.isLookingRight,
     required this.isBlinking,
     required this.yaw,
     required this.pitch,
@@ -51,6 +55,8 @@ class GazeTelemetryState {
         isAttentive: false,
         isLookingDown: false,
         isLookingUp: false,
+        isLookingLeft: false,
+        isLookingRight: false,
         isBlinking: false,
         yaw: 0.0,
         pitch: 0.0,
@@ -75,6 +81,8 @@ class GazeTelemetryState {
       isAttentive: map['isAttentive'] as bool? ?? false,
       isLookingDown: map['isLookingDown'] as bool? ?? false,
       isLookingUp: map['isLookingUp'] as bool? ?? false,
+      isLookingLeft: map['isLookingLeft'] as bool? ?? false,
+      isLookingRight: map['isLookingRight'] as bool? ?? false,
       isBlinking: map['isBlinking'] as bool? ?? false,
       yaw: (map['yaw'] as num? ?? 0.0).toDouble(),
       pitch: (map['pitch'] as num? ?? 0.0).toDouble(),

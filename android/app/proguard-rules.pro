@@ -1,0 +1,2 @@
+-keep class com.microsoft.onnxruntime.** { *; }
+-keep class ai.onnxruntime.** { *; }

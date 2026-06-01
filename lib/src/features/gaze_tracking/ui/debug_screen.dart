@@ -45,6 +45,12 @@ class _DebugScreenState extends ConsumerState<DebugScreen> {
         if (next.isLookingUp && !(prev?.isLookingUp ?? false)) {
           _addLog('LOOKING UP TRIGGER');
         }
+        if (next.isLookingLeft && !(prev?.isLookingLeft ?? false)) {
+          _addLog('LOOKING LEFT TRIGGER');
+        }
+        if (next.isLookingRight && !(prev?.isLookingRight ?? false)) {
+          _addLog('LOOKING RIGHT TRIGGER');
+        }
         if (next.isNodLeft && !(prev?.isNodLeft ?? false)) {
           _addLog('NOD LEFT DETECTED');
         }

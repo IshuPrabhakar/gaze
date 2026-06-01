@@ -37,9 +37,8 @@ class _CalibrationScreenState extends ConsumerState<CalibrationScreen> {
 
       final isFace = next.isFaceDetected;
       final isBlinking = next.isBlinking;
-      final isAttentive = next.isAttentive;
 
-      if (isFace && !isBlinking && isAttentive) {
+      if (isFace && !isBlinking) {
         final now = DateTime.now().millisecondsSinceEpoch;
         if (now - _lastSampleTime >= 150) {
           _lastSampleTime = now;

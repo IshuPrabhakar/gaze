@@ -69,6 +69,8 @@ class MainActivity : FlutterActivity() {
                                     "isAttentive" to state.isAttentive,
                                     "isLookingDown" to state.isLookingDown,
                                     "isLookingUp" to state.isLookingUp,
+                                    "isLookingLeft" to state.isLookingLeft,
+                                    "isLookingRight" to state.isLookingRight,
                                     "isBlinking" to state.isBlinking,
                                     "yaw" to state.yaw,
                                     "pitch" to state.pitch,

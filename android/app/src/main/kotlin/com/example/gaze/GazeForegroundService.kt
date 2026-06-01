@@ -85,6 +85,8 @@ class GazeForegroundService : Service() {
         val isAttentive: Boolean,
         val isLookingDown: Boolean,
         val isLookingUp: Boolean,
+        val isLookingLeft: Boolean = false,
+        val isLookingRight: Boolean = false,
         val isBlinking: Boolean,
         val yaw: Float,
         val pitch: Float,
@@ -106,7 +108,7 @@ class GazeForegroundService : Service() {
 
     // Outer data classes to resolve inner-class nested declaration restrictions in Kotlin
     data class BlinkResult(val isBlinking: Boolean, val blinkScore: Float, val eyeOpenness: Float)
-    data class HysteresisResult(val isLookingDown: Boolean, val isLookingUp: Boolean)
+    data class HysteresisResult(val isLookingDown: Boolean, val isLookingUp: Boolean, val isLookingLeft: Boolean, val isLookingRight: Boolean)
     data class AppGestureConfig(val swipeDistanceFraction: Float, val minIntervalMs: Long)
     data class AppInteractionProfile(val config: AppGestureConfig, val stabilityDurationMs: Long)
 
@@ -168,6 +170,8 @@ class GazeForegroundService : Service() {
 
     private var lookingDownStartTime = 0L
     private var lookingUpStartTime   = 0L
+    private var lookingLeftStartTime = 0L
+    private var lookingRightStartTime = 0L
 
     private var handLandmarker: HandLandmarker? = null
     private val swipeHistory = java.util.ArrayList<Pair<Long, android.graphics.PointF>>()
@@ -456,15 +460,34 @@ class GazeForegroundService : Service() {
     private fun initOnnx() {
         backgroundExecutor.execute {
             try {
+                val expectedOnnxSize = 235557L
+                val expectedDataSize = 95420416L
+
                 val modelFile = File(filesDir, "l2cs.onnx")
-                if (!modelFile.exists()) {
+                modelFile.parentFile?.mkdirs()
+                if (!modelFile.exists() || modelFile.length() != expectedOnnxSize) {
+                    Log.i(TAG, "Copying l2cs.onnx from assets to ${modelFile.absolutePath} (expected size: $expectedOnnxSize)...")
                     assets.open("l2cs.onnx").use { input ->
                         FileOutputStream(modelFile).use { output -> input.copyTo(output) }
                     }
                 }
+                
+                val modelDataFile = File(filesDir, "l2cs.onnx.data")
+                modelDataFile.parentFile?.mkdirs()
+                if (!modelDataFile.exists() || modelDataFile.length() != expectedDataSize) {
+                    try {
+                        Log.i(TAG, "Copying l2cs.onnx.data from assets to ${modelDataFile.absolutePath} (expected size: $expectedDataSize)...")
+                        assets.open("l2cs.onnx.data").use { input ->
+                            FileOutputStream(modelDataFile).use { output -> input.copyTo(output) }
+                        }
+                    } catch (e: Throwable) {
+                        Log.w(TAG, "External weights data file copy failed or not required", e)
+                    }
+                }
+
                 reflectiveRunner = OnnxReflectiveRunner(this, modelFile.absolutePath)
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to load ONNX model: ${e.message}. Fallback will execute inside pipeline.")
+            } catch (e: Throwable) {
+                Log.e(TAG, "Failed to load ONNX model. Fallback will execute inside pipeline.", e)
             }
         }
     }
@@ -621,15 +644,15 @@ class GazeForegroundService : Service() {
         val dy = offsetY + verticalBias
 
         var calibX = if (dx > 0) {
-            dx / if (rightThreshold != 0f) rightThreshold else 0.1f
-        } else {
             dx / if (leftThreshold != 0f) Math.abs(leftThreshold) else 0.1f
+        } else {
+            dx / if (rightThreshold != 0f) Math.abs(rightThreshold) else 0.1f
         }
 
         var calibY = if (dy > 0) {
-            dy / if (bottomThreshold != 0f) bottomThreshold else 0.1f
-        } else {
             dy / if (topThreshold != 0f) Math.abs(topThreshold) else 0.1f
+        } else {
+            dy / if (bottomThreshold != 0f) Math.abs(bottomThreshold) else 0.1f
         }
 
         calibX = calibX.coerceIn(-1.0f, 1.0f)
@@ -645,8 +668,10 @@ class GazeForegroundService : Service() {
         val hysteresisResult = directionHysteresis.applyHysteresis(smoothedYaw, smoothedPitch, sensitivity)
         val isLookingDown = hysteresisResult.isLookingDown
         val isLookingUp = hysteresisResult.isLookingUp
+        val isLookingLeft = hysteresisResult.isLookingLeft
+        val isLookingRight = hysteresisResult.isLookingRight
 
-        gazeStateMachine.evaluateState(confidence, isLookingDown || isLookingUp, isBlinking)
+        gazeStateMachine.evaluateState(confidence, isLookingDown || isLookingUp || isLookingLeft || isLookingRight, isBlinking)
 
         val yawNodThreshold   = 0.07f - (sensitivity * 0.025f)
         val pitchNodThreshold = 0.035f - (sensitivity * 0.012f)
@@ -730,6 +755,8 @@ class GazeForegroundService : Service() {
             isAttentive    = (gazeStateMachine.currentState == GazeStateEnum.STABLE_LOCK || gazeStateMachine.currentState == GazeStateEnum.ACTION_READY),
             isLookingDown  = isLookingDown,
             isLookingUp    = isLookingUp,
+            isLookingLeft  = isLookingLeft,
+            isLookingRight = isLookingRight,
             isBlinking     = isBlinking,
             yaw            = smoothedYaw,
             pitch          = smoothedPitch,
@@ -925,6 +952,40 @@ class GazeForegroundService : Service() {
             } else {
                 lookingUpStartTime = 0L
             }
+
+            if (state.isLookingLeft) {
+                if (lookingLeftStartTime == 0L) {
+                    lookingLeftStartTime = now
+                } else {
+                    val elapsed = now - lookingLeftStartTime
+                    if (elapsed >= activeDwell && (now - lastScrollTime) > scrollCooldownMs) {
+                        GazeAccessibilityService.instance?.performScrollLeft(scrollSpeed)
+                        lastScrollTime       = now
+                        lookingLeftStartTime = 0L
+                        safetyEngine.recordAction(now)
+                        updateNotification("Gaze Service Active", "Scrolled left via eye gaze.")
+                    }
+                }
+            } else {
+                lookingLeftStartTime = 0L
+            }
+
+            if (state.isLookingRight) {
+                if (lookingRightStartTime == 0L) {
+                    lookingRightStartTime = now
+                } else {
+                    val elapsed = now - lookingRightStartTime
+                    if (elapsed >= activeDwell && (now - lastScrollTime) > scrollCooldownMs) {
+                        GazeAccessibilityService.instance?.performScrollRight(scrollSpeed)
+                        lastScrollTime        = now
+                        lookingRightStartTime = 0L
+                        safetyEngine.recordAction(now)
+                        updateNotification("Gaze Service Active", "Scrolled right via eye gaze.")
+                    }
+                }
+            } else {
+                lookingRightStartTime = 0L
+            }
         }
 
         if (pauseOnLookAway) {
@@ -1088,6 +1149,7 @@ class GazeForegroundService : Service() {
     private fun emptyGazeState() = GazeState(
         isFaceDetected = false, isAttentive = false,
         isLookingDown  = false, isLookingUp  = false,
+        isLookingLeft  = false, isLookingRight = false,
         isBlinking     = false, yaw = 0f, pitch = 0f, eyeOpenness = 0f,
         isNodLeft = false, isNodRight = false, isNodUp = false, isNodDown = false,
         detectedHandGesture = "NONE", isSwipeLeft = false, isSwipeRight = false, isSwipeUp = false, isSwipeDown = false
@@ -1303,6 +1365,8 @@ class GazeForegroundService : Service() {
 
                 var isLookingDown = false
                 var isLookingUp   = false
+                var isLookingLeft = false
+                var isLookingRight = false
                 var isBlinking    = false
                 var isNodLeft     = false
                 var isNodRight    = false
@@ -1316,10 +1380,12 @@ class GazeForegroundService : Service() {
                 when (cycle) {
                     in 4..7  -> { isLookingDown = true; pitch =  0.25f }
                     in 10..13 -> { isLookingUp   = true; pitch = -0.05f }
+                    in 14..15 -> { isLookingLeft = true; yaw = -0.25f }
                     16       -> { isNodLeft  = true; yaw =  0.15f }
                     18       -> { isNodRight = true; yaw = -0.15f }
-                    20       -> { isNodDown  = true; pitch =  0.10f }
-                    22       -> { isNodUp    = true; pitch = -0.10f }
+                    in 19..20 -> { isLookingRight = true; yaw = 0.25f }
+                    21       -> { isNodDown  = true; pitch =  0.10f }
+                    23       -> { isNodUp    = true; pitch = -0.10f }
                     25       -> { isBlinking = true; eyeOpenness = 0f }
                     in 27..29 -> { isAttentive = false; yaw = 0.35f }
                 }
@@ -1327,6 +1393,7 @@ class GazeForegroundService : Service() {
                 val mockState = GazeState(
                     isFaceDetected = true, isAttentive = isAttentive,
                     isLookingDown  = isLookingDown, isLookingUp = isLookingUp,
+                    isLookingLeft  = isLookingLeft, isLookingRight = isLookingRight,
                     isBlinking     = isBlinking,
                     yaw = yaw, pitch = pitch, eyeOpenness = eyeOpenness,
                     isNodLeft  = isNodLeft,  isNodRight = isNodRight,
@@ -1561,7 +1628,7 @@ class GazeForegroundService : Service() {
             val avgBlinkScore   = (leftBlinkScore + rightBlinkScore) / 2f
             val eyeOpenness     = (1f - avgBlinkScore) * 100f
             
-            val isBlinking      = (avgBlinkScore * 0.55f + (if (avgEAR < 0.21f) 1.0f else 0.0f) * 0.45f) > 0.62f
+            val isBlinking      = (avgBlinkScore * 0.75f + (if (avgEAR < 0.16f) 1.0f else 0.0f) * 0.25f) > 0.72f
 
             return BlinkResult(isBlinking, avgBlinkScore, eyeOpenness)
         }
@@ -1573,6 +1640,8 @@ class GazeForegroundService : Service() {
     inner class DirectionHysteresis {
         private var wasLookingDown = false
         private var wasLookingUp = false
+        private var wasLookingLeft = false
+        private var wasLookingRight = false
 
         fun applyHysteresis(yaw: Float, pitch: Float, sensitivity: Float): HysteresisResult {
             val baseThreshold = 0.40f - (sensitivity * 0.18f)
@@ -1581,21 +1650,35 @@ class GazeForegroundService : Service() {
             val exitThreshold = baseThreshold * 0.80f
 
             val isLookingDown = if (wasLookingDown) {
-                pitch > exitThreshold
-            } else {
-                pitch > enterThreshold
-            }
-
-            val isLookingUp = if (wasLookingUp) {
                 pitch < -exitThreshold
             } else {
                 pitch < -enterThreshold
             }
 
+            val isLookingUp = if (wasLookingUp) {
+                pitch > exitThreshold
+            } else {
+                pitch > enterThreshold
+            }
+
+            val isLookingLeft = if (wasLookingLeft) {
+                yaw > exitThreshold
+            } else {
+                yaw > enterThreshold
+            }
+
+            val isLookingRight = if (wasLookingRight) {
+                yaw < -exitThreshold
+            } else {
+                yaw < -enterThreshold
+            }
+
             wasLookingDown = isLookingDown
             wasLookingUp = isLookingUp
+            wasLookingLeft = isLookingLeft
+            wasLookingRight = isLookingRight
 
-            return HysteresisResult(isLookingDown, isLookingUp)
+            return HysteresisResult(isLookingDown, isLookingUp, isLookingLeft, isLookingRight)
         }
     }
 
@@ -1682,68 +1765,148 @@ class GazeForegroundService : Service() {
     // ONNX Reflective Runner
     // ─────────────────────────────────────────────────────────────────────────
     class OnnxReflectiveRunner(private val context: Context, private val modelPath: String) {
+        companion object {
+            private val dummyEnv: Class<*> = ai.onnxruntime.OrtEnvironment::class.java
+            private val dummySession: Class<*> = ai.onnxruntime.OrtSession::class.java
+            private val dummyTensor: Class<*> = ai.onnxruntime.OnnxTensor::class.java
+        }
         private var env: Any? = null
         private var session: Any? = null
         private var isInitialized = false
 
+        private fun getReflectiveClass(className: String): Class<*> {
+            val classLoaders = listOfNotNull(
+                Thread.currentThread().contextClassLoader,
+                context.classLoader,
+                OnnxReflectiveRunner::class.java.classLoader,
+                GazeForegroundService::class.java.classLoader
+            )
+            for (cl in classLoaders) {
+                try {
+                    return Class.forName(className, true, cl)
+                } catch (ignored: Throwable) {
+                    // Try next classloader
+                }
+            }
+            // Final fallback to default classloader
+            return Class.forName(className)
+        }
+
         init {
             try {
-                val envClass = Class.forName("com.microsoft.onnxruntime.OrtEnvironment")
+                Log.i("OnnxReflective", "Initializing OrtEnvironment reflectively...")
+                val envClass = getReflectiveClass("ai.onnxruntime.OrtEnvironment")
                 val getEnvMethod = envClass.getMethod("getEnvironment")
                 env = getEnvMethod.invoke(null)
+                Log.i("OnnxReflective", "OrtEnvironment initialized successfully.")
 
-                val sessionOptionsClass = Class.forName("com.microsoft.onnxruntime.OrtSession\$SessionOptions")
+                val sessionOptionsClass = getReflectiveClass("ai.onnxruntime.OrtSession\$SessionOptions")
                 val sessionOptions = sessionOptionsClass.getDeclaredConstructor().newInstance()
                 
                 try {
                     val addNnapiMethod = sessionOptionsClass.getMethod("addNnapi")
                     addNnapiMethod.invoke(sessionOptions)
                     Log.i("OnnxReflective", "NNAPI enabled reflectively.")
-                } catch (e: Exception) {
-                    Log.w("OnnxReflective", "NNAPI not available reflectively.")
+                } catch (e: Throwable) {
+                    Log.w("OnnxReflective", "NNAPI not available reflectively or failed to bind. Defaulting to CPU.", e)
                 }
+
+                val modelFile = File(modelPath)
+                if (!modelFile.exists()) {
+                    throw java.io.FileNotFoundException("Model file does not exist at path: $modelPath")
+                }
+                if (!modelFile.canRead()) {
+                    throw java.io.IOException("Model file is not readable at path: $modelPath")
+                }
+                Log.i("OnnxReflective", "Model file validated: Path=${modelFile.absolutePath}, Size=${modelFile.length()} bytes")
 
                 val envClassInstance = envClass.cast(env)
                 val createSessionMethod = envClass.getMethod("createSession", String::class.java, sessionOptionsClass)
+                
+                Log.i("OnnxReflective", "Creating OrtSession with model: $modelPath...")
                 session = createSessionMethod.invoke(envClassInstance, modelPath, sessionOptions)
                 isInitialized = true
                 Log.i("OnnxReflective", "Reflective ONNX Session successfully created.")
-            } catch (e: Exception) {
-                Log.e("OnnxReflective", "Reflective ONNX initialization failed: ${e.message}")
+            } catch (e: Throwable) {
+                Log.e("OnnxReflective", "Reflective ONNX initialization failed", e)
             }
         }
 
+        private fun calculateExpectation(logits: FloatBuffer): Float {
+            val size = 90
+            val raw = FloatArray(size)
+            logits.rewind()
+            logits.get(raw)
+
+            var maxVal = Float.NEGATIVE_INFINITY
+            for (v in raw) {
+                if (v > maxVal) maxVal = v
+            }
+
+            var sumExp = 0.0f
+            val expValues = FloatArray(size)
+            for (i in 0 until size) {
+                expValues[i] = Math.exp((raw[i] - maxVal).toDouble()).toFloat()
+                sumExp += expValues[i]
+            }
+
+            var expectation = 0.0f
+            for (i in 0 until size) {
+                val prob = expValues[i] / (if (sumExp == 0f) 1f else sumExp)
+                expectation += prob * i
+            }
+
+            val angleDeg = expectation * 4.0f - 180.0f
+            val angleRad = angleDeg * (Math.PI.toFloat() / 180.0f)
+            return angleRad
+        }
+
         fun runInference(floatBuffer: FloatBuffer, shape: LongArray): Pair<Float, Float>? {
-            if (!isInitialized || env == null || session == null) return null
+            if (!isInitialized || env == null || session == null) {
+                Log.w("OnnxReflective", "Cannot run inference: OnnxReflectiveRunner is not fully initialized.")
+                return null
+            }
             try {
-                val onnxTensorClass = Class.forName("com.microsoft.onnxruntime.OnnxTensor")
+                val onnxTensorClass = getReflectiveClass("ai.onnxruntime.OnnxTensor")
+                val ortEnvClass = getReflectiveClass("ai.onnxruntime.OrtEnvironment")
                 val createTensorMethod = onnxTensorClass.getMethod(
                     "createTensor", 
-                    Class.forName("com.microsoft.onnxruntime.OrtEnvironment"), 
+                    ortEnvClass, 
                     FloatBuffer::class.java, 
                     LongArray::class.java
                 )
+                
+                // Create Tensor and map it
                 val inputTensor = createTensorMethod.invoke(null, env, floatBuffer, shape)
-
-                val inputMap = mapOf("input" to inputTensor)
-                val sessionClass = Class.forName("com.microsoft.onnxruntime.OrtSession")
+                
+                // Get input name dynamically
+                val sessionClass = getReflectiveClass("ai.onnxruntime.OrtSession")
+                val getInputNamesMethod = sessionClass.getMethod("getInputNames")
+                val inputNames = getInputNamesMethod.invoke(session) as Set<*>
+                val inputName = (inputNames.firstOrNull() as? String) ?: "input"
+                
+                val inputMap = mapOf(inputName to inputTensor)
                 val runMethod = sessionClass.getMethod("run", Map::class.java)
+                
                 val outputs = runMethod.invoke(session, inputMap)
 
-                val resultClass = Class.forName("com.microsoft.onnxruntime.OrtSession\$Result")
+                val resultClass = getReflectiveClass("ai.onnxruntime.OrtSession\$Result")
                 val sizeMethod = resultClass.getMethod("size")
                 val getMethod = resultClass.getMethod("get", Int::class.java)
 
                 val size = sizeMethod.invoke(outputs) as Int
-                if (size > 0) {
-                    val outVal = getMethod.invoke(outputs, 0)
-                    if (onnxTensorClass.isInstance(outVal)) {
-                        val getFloatBufferMethod = onnxTensorClass.getMethod("getFloatBuffer")
-                        val outputData = getFloatBufferMethod.invoke(outVal) as FloatBuffer
-                        outputData.rewind()
+                if (size >= 2) {
+                    val outValYaw = getMethod.invoke(outputs, 0)
+                    val outValPitch = getMethod.invoke(outputs, 1)
 
-                        val pitch = if (outputData.remaining() > 0) outputData.get() else 0f
-                        val yaw = if (outputData.remaining() > 0) outputData.get() else 0f
+                    if (onnxTensorClass.isInstance(outValYaw) && onnxTensorClass.isInstance(outValPitch)) {
+                        val getFloatBufferMethod = onnxTensorClass.getMethod("getFloatBuffer")
+                        
+                        val outputDataYaw = getFloatBufferMethod.invoke(outValYaw) as FloatBuffer
+                        val outputDataPitch = getFloatBufferMethod.invoke(outValPitch) as FloatBuffer
+                        
+                        val yaw = calculateExpectation(outputDataYaw)
+                        val pitch = calculateExpectation(outputDataPitch)
 
                         val closeResultMethod = resultClass.getMethod("close")
                         closeResultMethod.invoke(outputs)
@@ -1752,13 +1915,50 @@ class GazeForegroundService : Service() {
                         closeTensorMethod.invoke(inputTensor)
 
                         return Pair(pitch, yaw)
+                    } else {
+                        Log.e("OnnxReflective", "Output elements are not instances of OnnxTensor")
                     }
+                } else if (size == 1) {
+                    val outVal = getMethod.invoke(outputs, 0)
+                    if (onnxTensorClass.isInstance(outVal)) {
+                        val getFloatBufferMethod = onnxTensorClass.getMethod("getFloatBuffer")
+                        val outputData = getFloatBufferMethod.invoke(outVal) as FloatBuffer
+                        outputData.rewind()
+                        val remaining = outputData.remaining()
+
+                        if (remaining >= 90) {
+                            val yaw = calculateExpectation(outputData)
+                            val pitch = if (outputData.remaining() >= 90) calculateExpectation(outputData) else 0f
+                            
+                            val closeResultMethod = resultClass.getMethod("close")
+                            closeResultMethod.invoke(outputs)
+
+                            val closeTensorMethod = onnxTensorClass.getMethod("close")
+                            closeTensorMethod.invoke(inputTensor)
+
+                            return Pair(pitch, yaw)
+                        } else {
+                            // Fallback to legacy single-output raw values if not 90-bin logits
+                            val pitch = if (remaining > 0) outputData.get() else 0f
+                            val yaw = if (remaining > 1) outputData.get() else 0f
+
+                            val closeResultMethod = resultClass.getMethod("close")
+                            closeResultMethod.invoke(outputs)
+
+                            val closeTensorMethod = onnxTensorClass.getMethod("close")
+                            closeTensorMethod.invoke(inputTensor)
+
+                            return Pair(pitch, yaw)
+                        }
+                    }
+                } else {
+                    Log.e("OnnxReflective", "Session returned empty outputs")
                 }
                 
                 val closeTensorMethod = onnxTensorClass.getMethod("close")
                 closeTensorMethod.invoke(inputTensor)
-            } catch (e: Exception) {
-                Log.e("OnnxReflective", "Reflective ONNX runtime run failed: ${e.message}")
+            } catch (e: Throwable) {
+                Log.e("OnnxReflective", "Reflective ONNX runtime run failed", e)
             }
             return null
         }
@@ -1766,15 +1966,19 @@ class GazeForegroundService : Service() {
         fun close() {
             try {
                 if (session != null) {
-                    val sessionClass = Class.forName("com.microsoft.onnxruntime.OrtSession")
+                    val sessionClass = getReflectiveClass("ai.onnxruntime.OrtSession")
                     sessionClass.getMethod("close").invoke(session)
+                    session = null
                 }
                 if (env != null) {
-                    val envClass = Class.forName("com.microsoft.onnxruntime.OrtEnvironment")
+                    val envClass = getReflectiveClass("ai.onnxruntime.OrtEnvironment")
                     envClass.getMethod("close").invoke(env)
+                    env = null
                 }
-            } catch (e: Exception) {
-                Log.e("OnnxReflective", "Error closing reflective runner: ${e.message}")
+                isInitialized = false
+                Log.i("OnnxReflective", "Reflective runner resources closed successfully.")
+            } catch (e: Throwable) {
+                Log.e("OnnxReflective", "Error closing reflective runner", e)
             }
         }
     }

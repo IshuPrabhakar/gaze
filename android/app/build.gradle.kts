@@ -19,6 +19,10 @@ android {
         jvmTarget = JavaVersion.VERSION_17.toString()
     }
 
+    aaptOptions {
+        noCompress("task", "onnx", "data")
+    }
+
     defaultConfig {
         // TODO: Specify your own unique Application ID (https://developer.android.com/studio/build/application-id.html).
         applicationId = "com.example.gaze"
@@ -32,16 +36,24 @@ android {
 
     buildTypes {
         release {
-            // TODO: Add your own signing config for the release build.
-            // Signing with the debug keys for now, so `flutter run --release` works.
             signingConfig = signingConfigs.getByName("debug")
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+        }
+        debug {
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
     }
 }
 
+repositories {
+    google()
+    mavenCentral()
+}
+
 dependencies {
     implementation("com.google.mediapipe:tasks-vision:0.10.14")
-    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.17.0")
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.19.2")
+    compileOnly("com.microsoft.onnxruntime:onnxruntime:1.19.2")
 }
 
 flutter {
