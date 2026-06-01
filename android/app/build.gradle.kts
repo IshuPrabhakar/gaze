@@ -36,11 +36,16 @@ android {
 
     buildTypes {
         release {
-            signingConfig = signingConfigs.getByName("debug")
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            // TODO: Replace with production keystore before publishing.
+            // Use: signingConfig = signingConfigs.create("release") { ... } loaded from keystore.properties
+            signingConfig = signingConfigs.getByName("debug")
         }
         debug {
-            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            isMinifyEnabled = false
+            // No ProGuard on debug — faster iteration builds
         }
     }
 }
@@ -52,8 +57,11 @@ repositories {
 
 dependencies {
     implementation("com.google.mediapipe:tasks-vision:0.10.14")
+    // Maven artifact coordinate stays com.microsoft.onnxruntime; internal Java package is ai.onnxruntime.* (v1.14+)
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.19.2")
-    compileOnly("com.microsoft.onnxruntime:onnxruntime:1.19.2")
+    // Required by camera_android_camerax plugin
+    implementation("androidx.concurrent:concurrent-futures:1.1.0")
+    implementation("androidx.concurrent:concurrent-futures-ktx:1.1.0")
 }
 
 flutter {

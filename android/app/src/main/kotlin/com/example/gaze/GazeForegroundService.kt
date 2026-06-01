@@ -35,6 +35,9 @@ import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
+import ai.onnxruntime.OnnxTensor
+import ai.onnxruntime.OrtEnvironment
+import ai.onnxruntime.OrtSession
 import java.io.File
 import java.io.FileOutputStream
 import java.nio.ByteBuffer
@@ -157,8 +160,17 @@ class GazeForegroundService : Service() {
     private val baselineWarmupFrames  = 15
     private val baselineDriftRate = 0.995f
 
-    private var reflectiveRunner: OnnxReflectiveRunner? = null
-    private val inputSize = 96 
+    private var onnxRunner: OnnxDirectRunner? = null
+    private val inputSize = 96
+
+    // Preallocated inference buffer — avoids per-frame FloatBuffer.allocate() GC churn
+    // Layout: CHW (channels-first), 3 × 96 × 96 = 27,648 floats
+    private val inferenceFloatBuffer: FloatBuffer = FloatBuffer.allocate(3 * 96 * 96)
+    private val inferencePixelBuffer: IntArray = IntArray(96 * 96)
+
+    // ImageNet normalization constants (L2CS-Net was trained with these)
+    private val IMAGENET_MEAN = floatArrayOf(0.485f, 0.456f, 0.406f) // R, G, B
+    private val IMAGENET_STD  = floatArrayOf(0.229f, 0.224f, 0.225f) // R, G, B
 
     private var calibrationMatrix = floatArrayOf(
         1f, 0f, 0f, 
@@ -360,7 +372,7 @@ class GazeForegroundService : Service() {
         backgroundExecutor.shutdown()
         faceLandmarker?.close()
         handLandmarker?.close()
-        reflectiveRunner?.close()
+        onnxRunner?.close()
         simulatorHandler?.removeCallbacksAndMessages(null)
     }
 
@@ -485,7 +497,7 @@ class GazeForegroundService : Service() {
                     }
                 }
 
-                reflectiveRunner = OnnxReflectiveRunner(this, modelFile.absolutePath)
+                onnxRunner = OnnxDirectRunner(modelFile.absolutePath)
             } catch (e: Throwable) {
                 Log.e(TAG, "Failed to load ONNX model. Fallback will execute inside pipeline.", e)
             }
@@ -623,8 +635,11 @@ class GazeForegroundService : Service() {
                 val resizedRight = Bitmap.createScaledBitmap(rightCrop, inputSize, inputSize, true)
 
                 val output = runL2CSNetInference(resizedLeft, resizedRight)
-                rawPitch = output.first
-                rawYaw = output.second
+                // L2CS returns pitch/yaw in radians (range ~±π). Normalize to [-1, 1] using ±45° (π/4 rad)
+                // as the expected max gaze excursion. Values beyond ±45° saturate at ±1.
+                val maxGazeRad = (Math.PI / 4.0).toFloat() // 45 degrees
+                rawPitch = (output.first  / maxGazeRad).coerceIn(-1.0f, 1.0f)
+                rawYaw   = (output.second / maxGazeRad).coerceIn(-1.0f, 1.0f)
             } else {
                 // Heuristic fallback: Add baselines to align with subtraction below
                 rawYaw = yawDev * 0.7f + yawBaseline
@@ -747,7 +762,9 @@ class GazeForegroundService : Service() {
 
         // Diagnostics
         if (faceCount % 15 == 0) {
-            Log.d(TAG, "Gaze System | State=${gazeStateMachine.currentState} Confidence=${"%.2f".format(confidence)} | SmoothedYaw=${"%.3f".format(smoothedYaw)} SmoothedPitch=${"%.3f".format(smoothedPitch)} | LookDown=$isLookingDown LookUp=$isLookingUp")
+            Log.d(TAG, "Gaze System | State=${gazeStateMachine.currentState} Confidence=${"%.2f".format(confidence)}" +
+                " | NormYaw=${"%.3f".format(smoothedYaw)} NormPitch=${"%.3f".format(smoothedPitch)}" +
+                " | Down=$isLookingDown Up=$isLookingUp Left=$isLookingLeft Right=$isLookingRight")
         }
 
         val state = GazeState(
@@ -823,39 +840,37 @@ class GazeForegroundService : Service() {
     }
 
     private fun runL2CSNetInference(leftEye: Bitmap, rightEye: Bitmap): Pair<Float, Float> {
-        val runner = reflectiveRunner
+        val runner = onnxRunner
         if (runner == null) {
             return Pair(devicePitchDeg * 0.01f, deviceYawDeg * 0.01f)
         }
 
         try {
-            val numChannels = 3
-            val numElements = numChannels * inputSize * inputSize
-            val floatBuffer = FloatBuffer.allocate(numElements)
+            // Reuse preallocated pixel and float buffers — no per-frame heap allocation
+            leftEye.getPixels(inferencePixelBuffer, 0, inputSize, 0, 0, inputSize, inputSize)
+            inferenceFloatBuffer.rewind()
 
-            val leftPixels = IntArray(inputSize * inputSize)
-            leftEye.getPixels(leftPixels, 0, inputSize, 0, 0, inputSize, inputSize)
-
-            for (c in 0 until numChannels) {
+            // Pack CHW layout with ImageNet normalization (L2CS-Net requirement)
+            for (c in 0 until 3) {
+                val mean = IMAGENET_MEAN[c]
+                val std  = IMAGENET_STD[c]
                 for (i in 0 until inputSize * inputSize) {
-                    val pix = leftPixels[i]
-                    val channelValue = when (c) {
+                    val pix = inferencePixelBuffer[i]
+                    val raw = when (c) {
                         0 -> ((pix shr 16) and 0xFF) / 255.0f
-                        1 -> ((pix shr 8) and 0xFF) / 255.0f
-                        else -> (pix and 0xFF) / 255.0f
+                        1 -> ((pix shr 8)  and 0xFF) / 255.0f
+                        else -> (pix        and 0xFF) / 255.0f
                     }
-                    floatBuffer.put(channelValue)
+                    inferenceFloatBuffer.put((raw - mean) / std)
                 }
             }
-            floatBuffer.rewind()
+            inferenceFloatBuffer.rewind()
 
-            val shape = longArrayOf(1, numChannels.toLong(), inputSize.toLong(), inputSize.toLong())
-            val output = runner.runInference(floatBuffer, shape)
-            if (output != null) {
-                return output
-            }
+            val shape = longArrayOf(1, 3L, inputSize.toLong(), inputSize.toLong())
+            val output = runner.runInference(inferenceFloatBuffer, shape)
+            if (output != null) return output
         } catch (e: Exception) {
-            Log.e(TAG, "ONNX Inference execution error: ${e.message}")
+            Log.e(TAG, "ONNX inference execution error", e)
         }
         return Pair(devicePitchDeg * 0.01f, deviceYawDeg * 0.01f)
     }
@@ -1164,15 +1179,18 @@ class GazeForegroundService : Service() {
         val threadToQuit = cameraThread
         cameraThread  = null
         cameraHandler = null
-
-        Handler(Looper.getMainLooper()).postDelayed({
+        // Quit safely and join on a background thread to avoid blocking the main thread
+        // while also guaranteeing the join actually happens (fixes postDelayed race).
+        Thread("CameraShutdown") {
             try {
                 threadToQuit?.quitSafely()
-                threadToQuit?.join()
+                threadToQuit?.join(2000L) // 2 s max wait
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
             } catch (e: Exception) {
-                Log.e(TAG, "Error shutting down camera thread: ${e.message}")
+                Log.e(TAG, "Error shutting down camera thread", e)
             }
-        }, 500)
+        }.start()
     }
 
     private fun startCameraProcessing() {
@@ -1638,17 +1656,22 @@ class GazeForegroundService : Service() {
     // 5. DIRECTION HYSTERESIS
     // ─────────────────────────────────────────────────────────────────────────
     inner class DirectionHysteresis {
-        private var wasLookingDown = false
-        private var wasLookingUp = false
-        private var wasLookingLeft = false
+        private var wasLookingDown  = false
+        private var wasLookingUp    = false
+        private var wasLookingLeft  = false
         private var wasLookingRight = false
 
         fun applyHysteresis(yaw: Float, pitch: Float, sensitivity: Float): HysteresisResult {
-            val baseThreshold = 0.40f - (sensitivity * 0.18f)
-            
-            val enterThreshold = baseThreshold * 1.15f
-            val exitThreshold = baseThreshold * 0.80f
+            // sensitivity=0.5 (default) → baseThreshold = 0.30; range: 0.18 (high) – 0.45 (low)
+            val baseThreshold  = 0.45f - (sensitivity * 0.30f)
+            val enterThreshold = baseThreshold          // must exceed this to enter state
+            val exitThreshold  = baseThreshold * 0.65f  // must drop below this to exit (hysteresis gap)
 
+            // L2CS coordinate convention:
+            //   pitch > 0  → looking UP   (positive pitch = eyes tilted up)
+            //   pitch < 0  → looking DOWN
+            //   yaw   > 0  → looking RIGHT (L2CS positive yaw = rightward)
+            //   yaw   < 0  → looking LEFT
             val isLookingDown = if (wasLookingDown) {
                 pitch < -exitThreshold
             } else {
@@ -1661,21 +1684,22 @@ class GazeForegroundService : Service() {
                 pitch > enterThreshold
             }
 
-            val isLookingLeft = if (wasLookingLeft) {
+            // Fixed polarity: L2CS yaw > 0 = RIGHT, yaw < 0 = LEFT
+            val isLookingRight = if (wasLookingRight) {
                 yaw > exitThreshold
             } else {
                 yaw > enterThreshold
             }
 
-            val isLookingRight = if (wasLookingRight) {
+            val isLookingLeft = if (wasLookingLeft) {
                 yaw < -exitThreshold
             } else {
                 yaw < -enterThreshold
             }
 
-            wasLookingDown = isLookingDown
-            wasLookingUp = isLookingUp
-            wasLookingLeft = isLookingLeft
+            wasLookingDown  = isLookingDown
+            wasLookingUp    = isLookingUp
+            wasLookingLeft  = isLookingLeft
             wasLookingRight = isLookingRight
 
             return HysteresisResult(isLookingDown, isLookingUp, isLookingLeft, isLookingRight)
@@ -1762,223 +1786,113 @@ class GazeForegroundService : Service() {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // ONNX Reflective Runner
+    // ONNX Direct Runner (replaces reflection-based runner)
     // ─────────────────────────────────────────────────────────────────────────
-    class OnnxReflectiveRunner(private val context: Context, private val modelPath: String) {
+    class OnnxDirectRunner(private val modelPath: String) {
         companion object {
-            private val dummyEnv: Class<*> = ai.onnxruntime.OrtEnvironment::class.java
-            private val dummySession: Class<*> = ai.onnxruntime.OrtSession::class.java
-            private val dummyTensor: Class<*> = ai.onnxruntime.OnnxTensor::class.java
+            private const val TAG = "OnnxDirect"
         }
-        private var env: Any? = null
-        private var session: Any? = null
+        private val env: OrtEnvironment = OrtEnvironment.getEnvironment()
+        private var session: OrtSession? = null
+        private var inputName: String = "input"
         private var isInitialized = false
 
-        private fun getReflectiveClass(className: String): Class<*> {
-            val classLoaders = listOfNotNull(
-                Thread.currentThread().contextClassLoader,
-                context.classLoader,
-                OnnxReflectiveRunner::class.java.classLoader,
-                GazeForegroundService::class.java.classLoader
-            )
-            for (cl in classLoaders) {
-                try {
-                    return Class.forName(className, true, cl)
-                } catch (ignored: Throwable) {
-                    // Try next classloader
-                }
-            }
-            // Final fallback to default classloader
-            return Class.forName(className)
-        }
 
         init {
             try {
-                Log.i("OnnxReflective", "Initializing OrtEnvironment reflectively...")
-                val envClass = getReflectiveClass("ai.onnxruntime.OrtEnvironment")
-                val getEnvMethod = envClass.getMethod("getEnvironment")
-                env = getEnvMethod.invoke(null)
-                Log.i("OnnxReflective", "OrtEnvironment initialized successfully.")
-
-                val sessionOptionsClass = getReflectiveClass("ai.onnxruntime.OrtSession\$SessionOptions")
-                val sessionOptions = sessionOptionsClass.getDeclaredConstructor().newInstance()
-                
-                try {
-                    val addNnapiMethod = sessionOptionsClass.getMethod("addNnapi")
-                    addNnapiMethod.invoke(sessionOptions)
-                    Log.i("OnnxReflective", "NNAPI enabled reflectively.")
-                } catch (e: Throwable) {
-                    Log.w("OnnxReflective", "NNAPI not available reflectively or failed to bind. Defaulting to CPU.", e)
-                }
-
                 val modelFile = File(modelPath)
-                if (!modelFile.exists()) {
-                    throw java.io.FileNotFoundException("Model file does not exist at path: $modelPath")
-                }
-                if (!modelFile.canRead()) {
-                    throw java.io.IOException("Model file is not readable at path: $modelPath")
-                }
-                Log.i("OnnxReflective", "Model file validated: Path=${modelFile.absolutePath}, Size=${modelFile.length()} bytes")
+                if (!modelFile.exists()) throw java.io.FileNotFoundException("Model not found: $modelPath")
+                if (!modelFile.canRead())  throw java.io.IOException("Model not readable: $modelPath")
+                Log.i(TAG, "Model validated: ${modelFile.absolutePath} (${modelFile.length()} bytes)")
 
-                val envClassInstance = envClass.cast(env)
-                val createSessionMethod = envClass.getMethod("createSession", String::class.java, sessionOptionsClass)
-                
-                Log.i("OnnxReflective", "Creating OrtSession with model: $modelPath...")
-                session = createSessionMethod.invoke(envClassInstance, modelPath, sessionOptions)
+                val opts = OrtSession.SessionOptions()
+                try {
+                    opts.addNnapi()
+                    Log.i(TAG, "NNAPI acceleration enabled.")
+                } catch (e: Throwable) {
+                    Log.w(TAG, "NNAPI unavailable — using CPU fallback.", e)
+                }
+
+                session = env.createSession(modelPath, opts)
+                inputName = session!!.inputNames.first()
                 isInitialized = true
-                Log.i("OnnxReflective", "Reflective ONNX Session successfully created.")
+                Log.i(TAG, "OrtSession created. Input='$inputName' Outputs=${session!!.outputNames}")
             } catch (e: Throwable) {
-                Log.e("OnnxReflective", "Reflective ONNX initialization failed", e)
+                Log.e(TAG, "ONNX initialization failed", e)
             }
         }
 
-        private fun calculateExpectation(logits: FloatBuffer): Float {
+        private fun calculateExpectation(logits: FloatArray): Float {
             val size = 90
-            val raw = FloatArray(size)
-            logits.rewind()
-            logits.get(raw)
-
+            // Numerically stable softmax: subtract max before exp
             var maxVal = Float.NEGATIVE_INFINITY
-            for (v in raw) {
-                if (v > maxVal) maxVal = v
-            }
+            for (v in logits) if (v > maxVal) maxVal = v
 
             var sumExp = 0.0f
             val expValues = FloatArray(size)
             for (i in 0 until size) {
-                expValues[i] = Math.exp((raw[i] - maxVal).toDouble()).toFloat()
+                expValues[i] = Math.exp((logits[i] - maxVal).toDouble()).toFloat()
                 sumExp += expValues[i]
             }
+            if (sumExp == 0f) return 0f
 
             var expectation = 0.0f
             for (i in 0 until size) {
-                val prob = expValues[i] / (if (sumExp == 0f) 1f else sumExp)
-                expectation += prob * i
+                expectation += (expValues[i] / sumExp) * i
             }
 
+            // L2CS-Net bin mapping: bin 0..89 → -180°..+176°, step 4°/bin
             val angleDeg = expectation * 4.0f - 180.0f
-            val angleRad = angleDeg * (Math.PI.toFloat() / 180.0f)
-            return angleRad
+            return angleDeg * (Math.PI.toFloat() / 180.0f)
         }
 
         fun runInference(floatBuffer: FloatBuffer, shape: LongArray): Pair<Float, Float>? {
-            if (!isInitialized || env == null || session == null) {
-                Log.w("OnnxReflective", "Cannot run inference: OnnxReflectiveRunner is not fully initialized.")
+            if (!isInitialized) {
+                Log.w(TAG, "Runner not initialized — skipping inference.")
                 return null
             }
+            val sess = session ?: return null
+            var tensor: OnnxTensor? = null
             try {
-                val onnxTensorClass = getReflectiveClass("ai.onnxruntime.OnnxTensor")
-                val ortEnvClass = getReflectiveClass("ai.onnxruntime.OrtEnvironment")
-                val createTensorMethod = onnxTensorClass.getMethod(
-                    "createTensor", 
-                    ortEnvClass, 
-                    FloatBuffer::class.java, 
-                    LongArray::class.java
-                )
-                
-                // Create Tensor and map it
-                val inputTensor = createTensorMethod.invoke(null, env, floatBuffer, shape)
-                
-                // Get input name dynamically
-                val sessionClass = getReflectiveClass("ai.onnxruntime.OrtSession")
-                val getInputNamesMethod = sessionClass.getMethod("getInputNames")
-                val inputNames = getInputNamesMethod.invoke(session) as Set<*>
-                val inputName = (inputNames.firstOrNull() as? String) ?: "input"
-                
-                val inputMap = mapOf(inputName to inputTensor)
-                val runMethod = sessionClass.getMethod("run", Map::class.java)
-                
-                val outputs = runMethod.invoke(session, inputMap)
-
-                val resultClass = getReflectiveClass("ai.onnxruntime.OrtSession\$Result")
-                val sizeMethod = resultClass.getMethod("size")
-                val getMethod = resultClass.getMethod("get", Int::class.java)
-
-                val size = sizeMethod.invoke(outputs) as Int
-                if (size >= 2) {
-                    val outValYaw = getMethod.invoke(outputs, 0)
-                    val outValPitch = getMethod.invoke(outputs, 1)
-
-                    if (onnxTensorClass.isInstance(outValYaw) && onnxTensorClass.isInstance(outValPitch)) {
-                        val getFloatBufferMethod = onnxTensorClass.getMethod("getFloatBuffer")
-                        
-                        val outputDataYaw = getFloatBufferMethod.invoke(outValYaw) as FloatBuffer
-                        val outputDataPitch = getFloatBufferMethod.invoke(outValPitch) as FloatBuffer
-                        
-                        val yaw = calculateExpectation(outputDataYaw)
-                        val pitch = calculateExpectation(outputDataPitch)
-
-                        val closeResultMethod = resultClass.getMethod("close")
-                        closeResultMethod.invoke(outputs)
-
-                        val closeTensorMethod = onnxTensorClass.getMethod("close")
-                        closeTensorMethod.invoke(inputTensor)
-
+                tensor = OnnxTensor.createTensor(env, floatBuffer, shape)
+                sess.run(mapOf(inputName to tensor)).use { result ->
+                    val numOutputs = result.size()
+                    if (numOutputs >= 2) {
+                        // Model returns separate yaw and pitch tensors
+                        val yawLogits   = (result[0].value as Array<*>)[0] as FloatArray
+                        val pitchLogits = (result[1].value as Array<*>)[0] as FloatArray
+                        val yaw   = calculateExpectation(yawLogits)
+                        val pitch = calculateExpectation(pitchLogits)
+                        Log.d(TAG, "Inference OK | yaw=${"%.3f".format(yaw)}rad pitch=${"%.3f".format(pitch)}rad")
                         return Pair(pitch, yaw)
-                    } else {
-                        Log.e("OnnxReflective", "Output elements are not instances of OnnxTensor")
-                    }
-                } else if (size == 1) {
-                    val outVal = getMethod.invoke(outputs, 0)
-                    if (onnxTensorClass.isInstance(outVal)) {
-                        val getFloatBufferMethod = onnxTensorClass.getMethod("getFloatBuffer")
-                        val outputData = getFloatBufferMethod.invoke(outVal) as FloatBuffer
-                        outputData.rewind()
-                        val remaining = outputData.remaining()
-
-                        if (remaining >= 90) {
-                            val yaw = calculateExpectation(outputData)
-                            val pitch = if (outputData.remaining() >= 90) calculateExpectation(outputData) else 0f
-                            
-                            val closeResultMethod = resultClass.getMethod("close")
-                            closeResultMethod.invoke(outputs)
-
-                            val closeTensorMethod = onnxTensorClass.getMethod("close")
-                            closeTensorMethod.invoke(inputTensor)
-
-                            return Pair(pitch, yaw)
-                        } else {
-                            // Fallback to legacy single-output raw values if not 90-bin logits
-                            val pitch = if (remaining > 0) outputData.get() else 0f
-                            val yaw = if (remaining > 1) outputData.get() else 0f
-
-                            val closeResultMethod = resultClass.getMethod("close")
-                            closeResultMethod.invoke(outputs)
-
-                            val closeTensorMethod = onnxTensorClass.getMethod("close")
-                            closeTensorMethod.invoke(inputTensor)
-
+                    } else if (numOutputs == 1) {
+                        // Single flat output [1, 180]: first 90 = yaw logits, next 90 = pitch logits
+                        val flat = (result[0].value as Array<*>)[0] as FloatArray
+                        if (flat.size >= 180) {
+                            val yaw   = calculateExpectation(flat.copyOfRange(0, 90))
+                            val pitch = calculateExpectation(flat.copyOfRange(90, 180))
                             return Pair(pitch, yaw)
                         }
                     }
-                } else {
-                    Log.e("OnnxReflective", "Session returned empty outputs")
+                    Log.e(TAG, "Unexpected output count: $numOutputs")
                 }
-                
-                val closeTensorMethod = onnxTensorClass.getMethod("close")
-                closeTensorMethod.invoke(inputTensor)
             } catch (e: Throwable) {
-                Log.e("OnnxReflective", "Reflective ONNX runtime run failed", e)
+                Log.e(TAG, "Inference run failed", e)
+            } finally {
+                tensor?.close()
             }
             return null
         }
 
         fun close() {
             try {
-                if (session != null) {
-                    val sessionClass = getReflectiveClass("ai.onnxruntime.OrtSession")
-                    sessionClass.getMethod("close").invoke(session)
-                    session = null
-                }
-                if (env != null) {
-                    val envClass = getReflectiveClass("ai.onnxruntime.OrtEnvironment")
-                    envClass.getMethod("close").invoke(env)
-                    env = null
-                }
+                session?.close()
+                session = null
+                env.close()
                 isInitialized = false
-                Log.i("OnnxReflective", "Reflective runner resources closed successfully.")
+                Log.i(TAG, "OnnxDirectRunner closed.")
             } catch (e: Throwable) {
-                Log.e("OnnxReflective", "Error closing reflective runner", e)
+                Log.e(TAG, "Error closing OnnxDirectRunner", e)
             }
         }
     }
