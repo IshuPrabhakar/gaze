@@ -53,7 +53,10 @@ data class RuntimeCalibrationState(
     val deadzoneX: Float = 0.15f,
     val deadzoneY: Float = 0.15f,
     val offsetX: Float = 0.0f,
-    val offsetY: Float = 0.0f
+    val offsetY: Float = 0.0f,
+    // New fields for hysteresis scaling (default 0.8 = slightly more sensitive)
+    val hysteresisPitchScale: Float = 0.8f,
+    val hysteresisYawScale: Float = 0.8f
 )
 
 /**
@@ -72,6 +75,16 @@ class GazeAccessibilityService : AccessibilityService() {
         @Volatile
         var activePackageName: String = ""
             private set
+
+        // Helper to fetch the latest calibration state (including hysteresis scales)
+        fun getCurrentCalibration(): RuntimeCalibrationState =
+            instance?.calibrationManager?.getCalibration() ?: RuntimeCalibrationState()
+
+        // Expose runtime API for adjusting hysteresis scales
+        fun updateHysteresisScales(pitchScale: Float, yawScale: Float) {
+            instance?.calibrationManager?.updateHysteresisScales(pitchScale, yawScale)
+            Log.i(TAG, "Runtime API: Hysteresis scales set to pitch=$pitchScale, yaw=$yawScale")
+        }
     }
 
     // Coroutine scope for running async queue and state tasks safely
@@ -283,7 +296,10 @@ class GazeAccessibilityService : AccessibilityService() {
                     sensitivityX = sensitivityX * globalScale,
                     sensitivityY = sensitivityY * globalScale,
                     deadzoneX = deadzoneX,
-                    deadzoneY = deadzoneY
+                    deadzoneY = deadzoneY,
+                    // Preserve existing hysteresis scaling factors
+                    hysteresisPitchScale = state.get().hysteresisPitchScale,
+                    hysteresisYawScale = state.get().hysteresisYawScale
                 )
             )
         }
@@ -292,6 +308,18 @@ class GazeAccessibilityService : AccessibilityService() {
             globalScale = multiplier
             val current = state.get()
             update(current.sensitivityX / globalScale, current.sensitivityY / globalScale, current.deadzoneX, current.deadzoneY)
+        }
+
+        // Public API to tweak hysteresis scaling at runtime
+        fun updateHysteresisScales(pitchScale: Float, yawScale: Float) {
+            val cur = state.get()
+            state.set(
+                cur.copy(
+                    hysteresisPitchScale = pitchScale,
+                    hysteresisYawScale = yawScale
+                )
+            )
+            Log.i(TAG, "Hysteresis scales updated: pitchScale=$pitchScale, yawScale=$yawScale")
         }
 
         fun getCalibration(): RuntimeCalibrationState = state.get()

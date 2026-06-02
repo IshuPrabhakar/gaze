@@ -62,7 +62,7 @@ class GazeForegroundService : Service() {
         @Volatile
         var scrollSpeed: Float = 1.0f
         @Volatile
-        var triggerDurationMs: Long = 800L
+        var triggerDurationMs: Long = 500L
         @Volatile
         var pauseOnLookAway: Boolean = false
         @Volatile
@@ -81,6 +81,12 @@ class GazeForegroundService : Service() {
 
         @Volatile
         var telemetryListener: ((GazeState) -> Unit)? = null
+
+        private var lookUpStartTime = 0L
+        private var lookDownStartTime = 0L
+        private var lookLeftStartTime = 0L
+        private var lookRightStartTime = 0L
+        
     }
 
     data class GazeState(
@@ -635,58 +641,144 @@ class GazeForegroundService : Service() {
                 val resizedRight = Bitmap.createScaledBitmap(rightCrop, inputSize, inputSize, true)
 
                 val output = runL2CSNetInference(resizedLeft, resizedRight)
+                Log.d(
+                    TAG,
+                    "L2CS RAW => first=${output.first} second=${output.second}"
+                )
+
                 // L2CS returns pitch/yaw in radians (range ~±π). Normalize to [-1, 1] using ±45° (π/4 rad)
                 // as the expected max gaze excursion. Values beyond ±45° saturate at ±1.
-                val maxGazeRad = (Math.PI / 4.0).toFloat() // 45 degrees
-                rawPitch = (output.first  / maxGazeRad).coerceIn(-1.0f, 1.0f)
-                rawYaw   = (output.second / maxGazeRad).coerceIn(-1.0f, 1.0f)
+                val maxGazeRad = (Math.PI / 2.0).toFloat()
+
+                rawPitch = output.first / maxGazeRad
+                rawYaw   = output.second / maxGazeRad
+
+                Log.d(
+                    TAG,
+                    "RAW L2CS pitch=${output.first} yaw=${output.second} | normalized pitch=$rawPitch yaw=$rawYaw"
+                )
             } else {
                 // Heuristic fallback: Add baselines to align with subtraction below
-                rawYaw = yawDev * 0.7f + yawBaseline
-                rawPitch = pitchDev * 0.7f + pitchBaseline
+                rawYaw = yawDev
+                rawPitch = pitchDev
             }
         } else {
-            // Un-tracked or blinking: default to baseline to maintain zero-centered output
-            rawYaw = yawBaseline
-            rawPitch = pitchBaseline
+            // Preserve last valid gaze sample when blinking
+            rawYaw = smoothedYaw
+            rawPitch = smoothedPitch
         }
 
         // Apply active calibration biases and thresholds to map raw gaze into [-1.0, 1.0] range
-        val offsetX = rawYaw - yawBaseline
-        val offsetY = rawPitch - pitchBaseline
+        // L2CS already outputs gaze direction.
+        // Do not subtract MediaPipe head-pose baselines from gaze estimates.
 
-        val dx = offsetX + horizontalBias
-        val dy = offsetY + verticalBias
+        smoothedYaw = rawYaw
+        smoothedPitch = rawPitch
 
-        var calibX = if (dx > 0) {
-            dx / if (leftThreshold != 0f) Math.abs(leftThreshold) else 0.1f
+        Log.d(
+            TAG,
+            "PRE-HYSTERESIS yaw=$smoothedYaw pitch=$smoothedPitch"
+        )
+
+        val hysteresisResult =
+            directionHysteresis.applyHysteresis(
+                smoothedYaw,
+                smoothedPitch,
+                sensitivity
+            )
+
+        val rawLookingDown = hysteresisResult.isLookingDown
+        val rawLookingUp = hysteresisResult.isLookingUp
+        val rawLookingLeft = hysteresisResult.isLookingLeft
+        val rawLookingRight = hysteresisResult.isLookingRight
+
+        // --------------------
+        // HOLD-TO-ACTIVATE LOGIC
+        // --------------------
+
+        var isLookingDown = false
+        var isLookingUp = false
+        var isLookingLeft = false
+        var isLookingRight = false
+
+        // UP
+        if (rawLookingUp) {
+            if (lookUpStartTime == 0L) {
+                lookUpStartTime = now
+            }
+
+            if (now - lookUpStartTime >= triggerDurationMs) {
+                isLookingUp = true
+            }
         } else {
-            dx / if (rightThreshold != 0f) Math.abs(rightThreshold) else 0.1f
+            lookUpStartTime = 0L
         }
 
-        var calibY = if (dy > 0) {
-            dy / if (topThreshold != 0f) Math.abs(topThreshold) else 0.1f
+        // DOWN
+        if (rawLookingDown) {
+            if (lookDownStartTime == 0L) {
+                lookDownStartTime = now
+            }
+
+            if (now - lookDownStartTime >= triggerDurationMs) {
+                isLookingDown = true
+            }
         } else {
-            dy / if (bottomThreshold != 0f) Math.abs(bottomThreshold) else 0.1f
+            lookDownStartTime = 0L
         }
 
-        calibX = calibX.coerceIn(-1.0f, 1.0f)
-        calibY = calibY.coerceIn(-1.0f, 1.0f)
+        // LEFT
+        if (rawLookingLeft) {
+            if (lookLeftStartTime == 0L) {
+                lookLeftStartTime = now
+            }
 
-        val finalX = calibrationMatrix[0] * calibX + calibrationMatrix[1] * calibY + calibrationMatrix[2]
-        val finalY = calibrationMatrix[3] * calibX + calibrationMatrix[4] * calibY + calibrationMatrix[5]
+            if (now - lookLeftStartTime >= triggerDurationMs) {
+                isLookingLeft = true
+            }
+        } else {
+            lookLeftStartTime = 0L
+        }
 
-        val smoothed = safetyEngine.applyAdaptiveSmoothing(finalX, finalY, confidence, now)
-        smoothedYaw = smoothed.first
-        smoothedPitch = smoothed.second
+        // RIGHT
+        if (rawLookingRight) {
+            if (lookRightStartTime == 0L) {
+                lookRightStartTime = now
+            }
 
-        val hysteresisResult = directionHysteresis.applyHysteresis(smoothedYaw, smoothedPitch, sensitivity)
-        val isLookingDown = hysteresisResult.isLookingDown
-        val isLookingUp = hysteresisResult.isLookingUp
-        val isLookingLeft = hysteresisResult.isLookingLeft
-        val isLookingRight = hysteresisResult.isLookingRight
+            if (now - lookRightStartTime >= triggerDurationMs) {
+                isLookingRight = true
+            }
+        } else {
+            lookRightStartTime = 0L
+        }
 
-        gazeStateMachine.evaluateState(confidence, isLookingDown || isLookingUp || isLookingLeft || isLookingRight, isBlinking)
+        val neutralZone =
+            kotlin.math.abs(
+                smoothedPitch - directionHysteresis.pitchCenter
+            ) < 0.10f &&
+            kotlin.math.abs(smoothedYaw) < 0.05f
+
+        if (neutralZone) {
+            isLookingUp = false
+            isLookingDown = false
+            isLookingLeft = false
+            isLookingRight = false
+
+            lookUpStartTime = 0L
+            lookDownStartTime = 0L
+            lookLeftStartTime = 0L
+            lookRightStartTime = 0L
+        }
+
+        gazeStateMachine.evaluateState(
+            confidence,
+            isLookingUp ||
+            isLookingDown ||
+            isLookingLeft ||
+            isLookingRight,
+            isBlinking
+        )
 
         val yawNodThreshold   = 0.07f - (sensitivity * 0.025f)
         val pitchNodThreshold = 0.035f - (sensitivity * 0.012f)
@@ -1661,48 +1753,81 @@ class GazeForegroundService : Service() {
         private var wasLookingLeft  = false
         private var wasLookingRight = false
 
-        fun applyHysteresis(yaw: Float, pitch: Float, sensitivity: Float): HysteresisResult {
-            // sensitivity=0.5 (default) → baseThreshold = 0.30; range: 0.18 (high) – 0.45 (low)
-            val baseThreshold  = 0.45f - (sensitivity * 0.30f)
-            val enterThreshold = baseThreshold          // must exceed this to enter state
-            val exitThreshold  = baseThreshold * 0.65f  // must drop below this to exit (hysteresis gap)
+        // Expose for neutral-zone detection
+        var pitchCenter = -0.90f
+            private set
 
-            // L2CS coordinate convention:
-            //   pitch > 0  → looking UP   (positive pitch = eyes tilted up)
-            //   pitch < 0  → looking DOWN
-            //   yaw   > 0  → looking RIGHT (L2CS positive yaw = rightward)
-            //   yaw   < 0  → looking LEFT
-            val isLookingDown = if (wasLookingDown) {
-                pitch < -exitThreshold
-            } else {
-                pitch < -enterThreshold
-            }
+        fun applyHysteresis(
+            yaw: Float,
+            pitch: Float,
+            sensitivity: Float
+        ): HysteresisResult {
 
-            val isLookingUp = if (wasLookingUp) {
-                pitch > exitThreshold
-            } else {
-                pitch > enterThreshold
-            }
+            // Learn center slowly
+            pitchCenter =
+                pitchCenter * 0.995f +
+                pitch * 0.005f
 
-            // Fixed polarity: L2CS yaw > 0 = RIGHT, yaw < 0 = LEFT
-            val isLookingRight = if (wasLookingRight) {
-                yaw > exitThreshold
-            } else {
-                yaw > enterThreshold
-            }
+            // ---- Pitch thresholds ----
 
-            val isLookingLeft = if (wasLookingLeft) {
-                yaw < -exitThreshold
-            } else {
-                yaw < -enterThreshold
-            }
+            val upEnterOffset   = 0.22f
+            val upExitOffset    = 0.15f
 
-            wasLookingDown  = isLookingDown
-            wasLookingUp    = isLookingUp
-            wasLookingLeft  = isLookingLeft
+            val downEnterOffset = 0.22f
+            val downExitOffset  = 0.15f
+
+            val deltaPitch =
+                pitch - pitchCenter
+
+            val isLookingUp =
+                if (wasLookingUp) {
+                    deltaPitch < -upExitOffset
+                } else {
+                    deltaPitch < -upEnterOffset
+                }
+
+            val isLookingDown =
+                if (wasLookingDown) {
+                    deltaPitch > downExitOffset
+                } else {
+                    deltaPitch > downEnterOffset
+                }
+
+            // ---- Yaw thresholds ----
+
+            val enterYaw = 0.12f
+            val exitYaw  = 0.08f
+
+            val isLookingRight =
+                if (wasLookingRight) {
+                    yaw > exitYaw
+                } else {
+                    yaw > enterYaw
+                }
+
+            val isLookingLeft =
+                if (wasLookingLeft) {
+                    yaw < -exitYaw
+                } else {
+                    yaw < -enterYaw
+                }
+
+            wasLookingUp = isLookingUp
+            wasLookingDown = isLookingDown
+            wasLookingLeft = isLookingLeft
             wasLookingRight = isLookingRight
 
-            return HysteresisResult(isLookingDown, isLookingUp, isLookingLeft, isLookingRight)
+            Log.d(
+                TAG,
+                "HYST pitch=$pitch center=$pitchCenter delta=$deltaPitch up=$isLookingUp down=$isLookingDown"
+            )
+
+            return HysteresisResult(
+                isLookingDown,
+                isLookingUp,
+                isLookingLeft,
+                isLookingRight
+            )
         }
     }
 
