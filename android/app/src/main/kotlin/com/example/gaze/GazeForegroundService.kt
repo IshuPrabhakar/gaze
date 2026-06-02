@@ -1179,9 +1179,9 @@ class GazeForegroundService : Service() {
         val threadToQuit = cameraThread
         cameraThread  = null
         cameraHandler = null
-        // Quit safely and join on a background thread to avoid blocking the main thread
-        // while also guaranteeing the join actually happens (fixes postDelayed race).
-        Thread("CameraShutdown") {
+        // Quit safely and join on a background thread — avoids blocking main thread
+        // and guarantees the join completes (fixes the old postDelayed race condition).
+        Thread(Runnable {
             try {
                 threadToQuit?.quitSafely()
                 threadToQuit?.join(2000L) // 2 s max wait
@@ -1190,7 +1190,7 @@ class GazeForegroundService : Service() {
             } catch (e: Exception) {
                 Log.e(TAG, "Error shutting down camera thread", e)
             }
-        }.start()
+        }, "CameraShutdown").start()
     }
 
     private fun startCameraProcessing() {

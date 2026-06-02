@@ -61,3 +61,14 @@
     public static **[] values();
     public static ** valueOf(java.lang.String);
 }
+
+# ─── R8-generated: javax.lang.model (JDK APIs bundled in MediaPipe via autovalue/javapoet) ──
+# These classes don't exist on Android — suppress the missing-class warning.
+-dontwarn javax.lang.model.SourceVersion
+-dontwarn javax.lang.model.element.Element
+-dontwarn javax.lang.model.element.ElementKind
+-dontwarn javax.lang.model.type.TypeMirror
+-dontwarn javax.lang.model.type.TypeVisitor
+-dontwarn javax.lang.model.util.SimpleTypeVisitor8
+-dontwarn autovalue.shaded.com.squareup.javapoet.**
+-dontwarn com.google.auto.value.processor.**
