@@ -82,11 +82,6 @@ class GazeForegroundService : Service() {
         @Volatile
         var telemetryListener: ((GazeState) -> Unit)? = null
 
-        private var lookUpStartTime = 0L
-        private var lookDownStartTime = 0L
-        private var lookLeftStartTime = 0L
-        private var lookRightStartTime = 0L
-        
     }
 
     data class GazeState(
@@ -510,9 +505,7 @@ class GazeForegroundService : Service() {
         }
     }
 
-    private fun processFaceLandmarks(result: FaceLandmarkerResult) {
-        // Obsolete signature.
-    }
+
 
     private fun processFaceLandmarksWithBitmap(result: FaceLandmarkerResult, frameBitmap: Bitmap) {
         val blendshapesOptional = result.faceBlendshapes()
@@ -630,50 +623,47 @@ class GazeForegroundService : Service() {
         var rawYaw = 0f
 
         if (confidence > 0.40f && !isBlinking) {
-            val leftEyeRect = cropStabilizer.getStabilizedEyeBoundingBox(face, true, frameBitmap.width, frameBitmap.height)
-            val rightEyeRect = cropStabilizer.getStabilizedEyeBoundingBox(face, false, frameBitmap.width, frameBitmap.height)
+            // FIX 2: Crop a face strip spanning both eyes (brow-to-nose region) — this is the
+            // canonical single-input L2CS-Net ONNX format. Feeding only the left eye crop was
+            // wrong and produced unreliable output.
+            val faceStripRect = getFaceStripBoundingBox(face, frameBitmap.width, frameBitmap.height)
+            val faceCrop = cropBitmapSafe(frameBitmap, faceStripRect)
 
-            val leftCrop = cropBitmapSafe(frameBitmap, leftEyeRect)
-            val rightCrop = cropBitmapSafe(frameBitmap, rightEyeRect)
+            if (faceCrop != null) {
+                val resizedFace = Bitmap.createScaledBitmap(faceCrop, inputSize, inputSize, true)
 
-            if (leftCrop != null && rightCrop != null) {
-                val resizedLeft = Bitmap.createScaledBitmap(leftCrop, inputSize, inputSize, true)
-                val resizedRight = Bitmap.createScaledBitmap(rightCrop, inputSize, inputSize, true)
-
-                val output = runL2CSNetInference(resizedLeft, resizedRight)
+                val output = runL2CSNetInference(resizedFace)
                 Log.d(
                     TAG,
-                    "L2CS RAW => first=${output.first} second=${output.second}"
+                    "L2CS RAW => pitch=${output.first} yaw=${output.second}"
                 )
 
-                // L2CS returns pitch/yaw in radians (range ~±π). Normalize to [-1, 1] using ±45° (π/4 rad)
-                // as the expected max gaze excursion. Values beyond ±45° saturate at ±1.
+                // L2CS returns pitch/yaw in radians. Normalize to [-1, 1] using ±90° (π/2 rad)
+                // as the expected max gaze excursion.
                 val maxGazeRad = (Math.PI / 2.0).toFloat()
 
-                rawPitch = output.first / maxGazeRad
-                rawYaw   = output.second / maxGazeRad
+                rawPitch = (output.first / maxGazeRad).coerceIn(-1f, 1f)
+                rawYaw   = (output.second / maxGazeRad).coerceIn(-1f, 1f)
 
                 Log.d(
                     TAG,
                     "RAW L2CS pitch=${output.first} yaw=${output.second} | normalized pitch=$rawPitch yaw=$rawYaw"
                 )
             } else {
-                // Heuristic fallback: Add baselines to align with subtraction below
+                // Heuristic fallback when face crop unavailable
                 rawYaw = yawDev
                 rawPitch = pitchDev
             }
         } else {
-            // Preserve last valid gaze sample when blinking
+            // Preserve last valid gaze sample when blinking or low confidence
             rawYaw = smoothedYaw
             rawPitch = smoothedPitch
         }
 
-        // Apply active calibration biases and thresholds to map raw gaze into [-1.0, 1.0] range
-        // L2CS already outputs gaze direction.
-        // Do not subtract MediaPipe head-pose baselines from gaze estimates.
-
-        smoothedYaw = rawYaw
-        smoothedPitch = rawPitch
+        // FIX 7: Apply OneEuroFilter smoothing to suppress frame-to-frame noise.
+        // Previously smoothedYaw/Pitch were direct assignments (no filtering at all).
+        smoothedYaw   = filterHeadYaw?.filter(rawYaw.toDouble(), now)?.toFloat()   ?: rawYaw
+        smoothedPitch = filterHeadPitch?.filter(rawPitch.toDouble(), now)?.toFloat() ?: rawPitch
 
         Log.d(
             TAG,
@@ -694,6 +684,9 @@ class GazeForegroundService : Service() {
 
         // --------------------
         // HOLD-TO-ACTIVATE LOGIC
+        // FIX 1: Use instance-level timer fields (lookingUpStartTime, etc.) instead of the
+        // now-removed companion-object duplicates. This prevents the two timing gates from
+        // corrupting each other's state.
         // --------------------
 
         var isLookingDown = false
@@ -703,61 +696,60 @@ class GazeForegroundService : Service() {
 
         // UP
         if (rawLookingUp) {
-            if (lookUpStartTime == 0L) {
-                lookUpStartTime = now
+            if (lookingUpStartTime == 0L) {
+                lookingUpStartTime = now
             }
 
-            if (now - lookUpStartTime >= triggerDurationMs) {
+            if (now - lookingUpStartTime >= triggerDurationMs) {
                 isLookingUp = true
             }
         } else {
-            lookUpStartTime = 0L
+            lookingUpStartTime = 0L
         }
 
         // DOWN
         if (rawLookingDown) {
-            if (lookDownStartTime == 0L) {
-                lookDownStartTime = now
+            if (lookingDownStartTime == 0L) {
+                lookingDownStartTime = now
             }
 
-            if (now - lookDownStartTime >= triggerDurationMs) {
+            if (now - lookingDownStartTime >= triggerDurationMs) {
                 isLookingDown = true
             }
         } else {
-            lookDownStartTime = 0L
+            lookingDownStartTime = 0L
         }
 
         // LEFT
         if (rawLookingLeft) {
-            if (lookLeftStartTime == 0L) {
-                lookLeftStartTime = now
+            if (lookingLeftStartTime == 0L) {
+                lookingLeftStartTime = now
             }
 
-            if (now - lookLeftStartTime >= triggerDurationMs) {
+            if (now - lookingLeftStartTime >= triggerDurationMs) {
                 isLookingLeft = true
             }
         } else {
-            lookLeftStartTime = 0L
+            lookingLeftStartTime = 0L
         }
 
         // RIGHT
         if (rawLookingRight) {
-            if (lookRightStartTime == 0L) {
-                lookRightStartTime = now
+            if (lookingRightStartTime == 0L) {
+                lookingRightStartTime = now
             }
 
-            if (now - lookRightStartTime >= triggerDurationMs) {
+            if (now - lookingRightStartTime >= triggerDurationMs) {
                 isLookingRight = true
             }
         } else {
-            lookRightStartTime = 0L
+            lookingRightStartTime = 0L
         }
 
+        // FIX: Neutral zone widened and uses yawCenter to prevent baseline bias.
         val neutralZone =
-            kotlin.math.abs(
-                smoothedPitch - directionHysteresis.pitchCenter
-            ) < 0.10f &&
-            kotlin.math.abs(smoothedYaw) < 0.05f
+            kotlin.math.abs(smoothedPitch - directionHysteresis.pitchCenter) < 0.15f &&
+            kotlin.math.abs(smoothedYaw - directionHysteresis.yawCenter) < 0.12f
 
         if (neutralZone) {
             isLookingUp = false
@@ -765,10 +757,10 @@ class GazeForegroundService : Service() {
             isLookingLeft = false
             isLookingRight = false
 
-            lookUpStartTime = 0L
-            lookDownStartTime = 0L
-            lookLeftStartTime = 0L
-            lookRightStartTime = 0L
+            lookingUpStartTime = 0L
+            lookingDownStartTime = 0L
+            lookingLeftStartTime = 0L
+            lookingRightStartTime = 0L
         }
 
         gazeStateMachine.evaluateState(
@@ -788,7 +780,12 @@ class GazeForegroundService : Service() {
         var isNodUp    = false
         var isNodDown  = false
 
-        if (gazeStateMachine.currentState == GazeStateEnum.STABLE_LOCK && (now - lastScrollTime) > scrollCooldownMs) {
+        // FIX 4: Allow nod detection in TRACKING state as well, not just STABLE_LOCK.
+        // In STABLE_LOCK, any gaze movement triggers a state transition away immediately,
+        // so nods would never fire.
+        val nodAllowedState = gazeStateMachine.currentState == GazeStateEnum.STABLE_LOCK ||
+                              gazeStateMachine.currentState == GazeStateEnum.TRACKING
+        if (nodAllowedState && (now - lastScrollTime) > scrollCooldownMs) {
             when (yawNodPhase) {
                 NodPhase.IDLE -> {
                     if (Math.abs(yawDev) > yawNodThreshold) {
@@ -931,7 +928,12 @@ class GazeForegroundService : Service() {
         return Bitmap.createBitmap(src, x, y, w, h)
     }
 
-    private fun runL2CSNetInference(leftEye: Bitmap, rightEye: Bitmap): Pair<Float, Float> {
+    /**
+     * FIX 2: Accept a single face-region crop (spanning both eyes) instead of separate
+     * per-eye crops. L2CS-Net's canonical ONNX export expects a single [1,3,96,96] input
+     * of the face region — feeding only the left eye was producing wrong gaze estimates.
+     */
+    private fun runL2CSNetInference(faceCrop: Bitmap): Pair<Float, Float> {
         val runner = onnxRunner
         if (runner == null) {
             return Pair(devicePitchDeg * 0.01f, deviceYawDeg * 0.01f)
@@ -939,7 +941,7 @@ class GazeForegroundService : Service() {
 
         try {
             // Reuse preallocated pixel and float buffers — no per-frame heap allocation
-            leftEye.getPixels(inferencePixelBuffer, 0, inputSize, 0, 0, inputSize, inputSize)
+            faceCrop.getPixels(inferencePixelBuffer, 0, inputSize, 0, 0, inputSize, inputSize)
             inferenceFloatBuffer.rewind()
 
             // Pack CHW layout with ImageNet normalization (L2CS-Net requirement)
@@ -965,6 +967,47 @@ class GazeForegroundService : Service() {
             Log.e(TAG, "ONNX inference execution error", e)
         }
         return Pair(devicePitchDeg * 0.01f, deviceYawDeg * 0.01f)
+    }
+
+    /**
+     * Computes a face bounding box spanning from the eyebrows to just below the nose,
+     * which is the canonical input region for L2CS-Net.
+     * Landmark indices used:
+     *   - 70, 300 : outer eyebrow corners (top boundary)
+     *   - 33, 263 : inner eye corners (horizontal extent)
+     *   - 4       : nose tip (bottom boundary)
+     */
+    private fun getFaceStripBoundingBox(face: List<NormalizedLandmark>, width: Int, height: Int): RectF {
+        // Landmarks that define the brow-to-nose face strip
+        val indices = intArrayOf(70, 300, 33, 263, 159, 386, 145, 374, 4, 1)
+
+        var minX = Float.MAX_VALUE
+        var maxX = -Float.MAX_VALUE
+        var minY = Float.MAX_VALUE
+        var maxY = -Float.MAX_VALUE
+
+        for (idx in indices) {
+            if (idx < face.size) {
+                val lm = face[idx]
+                val x = lm.x() * width
+                val y = lm.y() * height
+                if (x < minX) minX = x
+                if (x > maxX) maxX = x
+                if (y < minY) minY = y
+                if (y > maxY) maxY = y
+            }
+        }
+
+        // Add generous padding to include full eye context
+        val pw = (maxX - minX) * 0.35f
+        val ph = (maxY - minY) * 0.35f
+
+        return RectF(
+            (minX - pw).coerceAtLeast(0f),
+            (minY - ph).coerceAtLeast(0f),
+            (maxX + pw).coerceAtMost(width.toFloat()),
+            (maxY + ph).coerceAtMost(height.toFloat())
+        )
     }
 
     private fun handleGazeStateAction(state: GazeState) {
@@ -1024,74 +1067,36 @@ class GazeForegroundService : Service() {
                 }
             }
         } else if (swipeMode == "eyeTracking") {
-            val activeDwell = profile.stabilityDurationMs
-
-            if (state.isLookingDown) {
-                if (lookingDownStartTime == 0L) {
-                    lookingDownStartTime = now
-                } else {
-                    val elapsed = now - lookingDownStartTime
-                    if (elapsed >= activeDwell && (now - lastScrollTime) > scrollCooldownMs) {
-                        GazeAccessibilityService.instance?.performScrollDown(scrollSpeed)
-                        lastScrollTime       = now
-                        lookingDownStartTime = 0L
-                        safetyEngine.recordAction(now)
-                        updateNotification("Gaze Service Active", "Scrolled down via eye gaze.")
-                    }
-                }
-            } else {
-                lookingDownStartTime = 0L
+            // FIX 5: Remove the redundant second dwell gate. The GazeState flags
+            // (isLookingDown etc.) already encode a confirmed hold of triggerDurationMs.
+            // Applying another stabilityDurationMs on top pushed required hold to 1.1s+.
+            // Now we trigger immediately when the flag is true, subject only to scrollCooldownMs.
+            if (state.isLookingDown && (now - lastScrollTime) > scrollCooldownMs) {
+                GazeAccessibilityService.instance?.performScrollDown(scrollSpeed)
+                lastScrollTime = now
+                safetyEngine.recordAction(now)
+                updateNotification("Gaze Service Active", "Scrolled down via eye gaze.")
             }
 
-            if (state.isLookingUp) {
-                if (lookingUpStartTime == 0L) {
-                    lookingUpStartTime = now
-                } else {
-                    val elapsed = now - lookingUpStartTime
-                    if (elapsed >= activeDwell && (now - lastScrollTime) > scrollCooldownMs) {
-                        GazeAccessibilityService.instance?.performScrollUp(scrollSpeed)
-                        lastScrollTime     = now
-                        lookingUpStartTime = 0L
-                        safetyEngine.recordAction(now)
-                        updateNotification("Gaze Service Active", "Scrolled up via eye gaze.")
-                    }
-                }
-            } else {
-                lookingUpStartTime = 0L
+            if (state.isLookingUp && (now - lastScrollTime) > scrollCooldownMs) {
+                GazeAccessibilityService.instance?.performScrollUp(scrollSpeed)
+                lastScrollTime = now
+                safetyEngine.recordAction(now)
+                updateNotification("Gaze Service Active", "Scrolled up via eye gaze.")
             }
 
-            if (state.isLookingLeft) {
-                if (lookingLeftStartTime == 0L) {
-                    lookingLeftStartTime = now
-                } else {
-                    val elapsed = now - lookingLeftStartTime
-                    if (elapsed >= activeDwell && (now - lastScrollTime) > scrollCooldownMs) {
-                        GazeAccessibilityService.instance?.performScrollLeft(scrollSpeed)
-                        lastScrollTime       = now
-                        lookingLeftStartTime = 0L
-                        safetyEngine.recordAction(now)
-                        updateNotification("Gaze Service Active", "Scrolled left via eye gaze.")
-                    }
-                }
-            } else {
-                lookingLeftStartTime = 0L
+            if (state.isLookingLeft && (now - lastScrollTime) > scrollCooldownMs) {
+                GazeAccessibilityService.instance?.performScrollLeft(scrollSpeed)
+                lastScrollTime = now
+                safetyEngine.recordAction(now)
+                updateNotification("Gaze Service Active", "Scrolled left via eye gaze.")
             }
 
-            if (state.isLookingRight) {
-                if (lookingRightStartTime == 0L) {
-                    lookingRightStartTime = now
-                } else {
-                    val elapsed = now - lookingRightStartTime
-                    if (elapsed >= activeDwell && (now - lastScrollTime) > scrollCooldownMs) {
-                        GazeAccessibilityService.instance?.performScrollRight(scrollSpeed)
-                        lastScrollTime        = now
-                        lookingRightStartTime = 0L
-                        safetyEngine.recordAction(now)
-                        updateNotification("Gaze Service Active", "Scrolled right via eye gaze.")
-                    }
-                }
-            } else {
-                lookingRightStartTime = 0L
+            if (state.isLookingRight && (now - lastScrollTime) > scrollCooldownMs) {
+                GazeAccessibilityService.instance?.performScrollRight(scrollSpeed)
+                lastScrollTime = now
+                safetyEngine.recordAction(now)
+                updateNotification("Gaze Service Active", "Scrolled right via eye gaze.")
             }
         }
 
@@ -1384,12 +1389,21 @@ class GazeForegroundService : Service() {
         frameCount++
 
         try {
-            val bitmap  = yuvToBitmap(image)
+            val rawBitmap  = yuvToBitmap(image)
             image.close()
+
+            val bitmap = if (sensorOrientation != 0) {
+                val matrix = Matrix().apply { postRotate(sensorOrientation.toFloat()) }
+                val rotated = Bitmap.createBitmap(rawBitmap, 0, 0, rawBitmap.width, rawBitmap.height, matrix, true)
+                rawBitmap.recycle()
+                rotated
+            } else {
+                rawBitmap
+            }
 
             val mpImage = BitmapImageBuilder(bitmap).build()
             val opts    = ImageProcessingOptions.builder()
-                .setRotationDegrees(sensorOrientation)
+                .setRotationDegrees(0)
                 .build()
 
             faceLandmarker?.detectAsync(mpImage, opts, now)
@@ -1754,7 +1768,10 @@ class GazeForegroundService : Service() {
         private var wasLookingRight = false
 
         // Expose for neutral-zone detection
-        var pitchCenter = -0.90f
+        var pitchCenter = 0.0f
+            private set
+            
+        var yawCenter = 0.0f
             private set
 
         fun applyHysteresis(
@@ -1763,21 +1780,30 @@ class GazeForegroundService : Service() {
             sensitivity: Float
         ): HysteresisResult {
 
-            // Learn center slowly
-            pitchCenter =
-                pitchCenter * 0.995f +
-                pitch * 0.005f
+            // Learn center slowly ONLY when gaze is neutral (not actively triggering an action)
+            // This prevents the baseline from drifting and killing a sustained gaze command.
+            if (!wasLookingDown && !wasLookingUp && !wasLookingLeft && !wasLookingRight) {
+                pitchCenter = pitchCenter * 0.995f + pitch * 0.005f
+                yawCenter = yawCenter * 0.995f + yaw * 0.005f
+            }
 
-            // ---- Pitch thresholds ----
+            // ---- Dynamic thresholds incorporating personalized calibration & sensitivity ----
+            // Higher sensitivity => smaller thresholds (easier to trigger).
+            val sensMultiplier  = (1.5f - sensitivity).coerceIn(0.5f, 2.0f)
 
-            val upEnterOffset   = 0.22f
-            val upExitOffset    = 0.15f
+            val upEnterOffset   = (Math.abs(topThreshold) * sensMultiplier).coerceAtLeast(0.05f)
+            val upExitOffset    = upEnterOffset * 0.55f
 
-            val downEnterOffset = 0.22f
-            val downExitOffset  = 0.15f
+            val downEnterOffset = (Math.abs(bottomThreshold) * sensMultiplier).coerceAtLeast(0.05f)
+            val downExitOffset  = downEnterOffset * 0.55f
 
-            val deltaPitch =
-                pitch - pitchCenter
+            val leftEnterOffset = (Math.abs(leftThreshold) * sensMultiplier).coerceAtLeast(0.05f)
+            val leftExitOffset  = leftEnterOffset * 0.58f
+
+            val rightEnterOffset = (Math.abs(rightThreshold) * sensMultiplier).coerceAtLeast(0.05f)
+            val rightExitOffset  = rightEnterOffset * 0.58f
+
+            val deltaPitch = pitch - pitchCenter
 
             val isLookingUp =
                 if (wasLookingUp) {
@@ -1793,23 +1819,20 @@ class GazeForegroundService : Service() {
                     deltaPitch > downEnterOffset
                 }
 
-            // ---- Yaw thresholds ----
-
-            val enterYaw = 0.12f
-            val exitYaw  = 0.08f
+            val deltaYaw = yaw - yawCenter
 
             val isLookingRight =
                 if (wasLookingRight) {
-                    yaw > exitYaw
+                    deltaYaw > rightExitOffset
                 } else {
-                    yaw > enterYaw
+                    deltaYaw > rightEnterOffset
                 }
 
             val isLookingLeft =
                 if (wasLookingLeft) {
-                    yaw < -exitYaw
+                    deltaYaw < -leftExitOffset
                 } else {
-                    yaw < -enterYaw
+                    deltaYaw < -leftEnterOffset
                 }
 
             wasLookingUp = isLookingUp

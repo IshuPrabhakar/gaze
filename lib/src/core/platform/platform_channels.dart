@@ -46,7 +46,7 @@ class GazeTelemetryState {
     required this.isSwipeRight,
     required this.isSwipeUp,
     required this.isSwipeDown,
-    required this.rawConfidence,
+    required this.rawConfidence ,
     required this.internalState,
   });
 
